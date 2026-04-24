@@ -1,0 +1,7 @@
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "unit: fast tests, no browser",
+    "integration: slower tests, uses Playwright against local fixture server",
+]

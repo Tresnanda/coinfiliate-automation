@@ -1,0 +1,29 @@
+networks: ["flexoffers"]
+
+sync:
+  page: 1
+  page_size: 100
+  selectable_fields: "all"
+
+runner:
+  max_shops_per_batch: 50
+  max_concurrency: 4
+  inter_shop_jitter_ms: [500, 2000]
+
+harvest:
+  networkidle_timeout_seconds: 15
+  consent_wait_ms: 2000
+  review_threshold: 0.0
+
+writeback:
+  verify_after_save: true
+
+llm:
+  provider: "openai"
+  model: "gpt-4o-mini"
+  max_retries: 3
+  timeout_seconds: 30
+
+logging:
+  level: "INFO"
+  debug_log_retention_days: 7
