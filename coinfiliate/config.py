@@ -37,7 +37,7 @@ class LLMConfig(BaseModel):
 
 
 class LoggingConfig(BaseModel):
-    level: str = "INFO"
+    level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     debug_log_retention_days: int = 7
 
 
@@ -61,5 +61,9 @@ class Settings(BaseSettings):
 
 
 def load_settings(config_path: Path = Path("config.yaml")) -> Settings:
-    yaml_data = yaml.safe_load(config_path.read_text()) if config_path.exists() else {}
+    # Note: pydantic-settings does not propagate nested env vars (e.g. SYNC__PAGE) into
+    # nested BaseModel fields with this configuration. Nested config comes from YAML only;
+    # env vars only affect top-level fields like coinfiliate_email, openai_api_key, etc.
+    raw = yaml.safe_load(config_path.read_text()) if config_path.exists() else {}
+    yaml_data = raw or {}  # safe_load returns None for empty/comment-only files
     return Settings(**yaml_data)

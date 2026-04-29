@@ -1,5 +1,7 @@
 from pathlib import Path
+import pytest
 import yaml
+from pydantic import ValidationError
 from coinfiliate.config import Settings, load_settings
 
 
@@ -27,12 +29,19 @@ def test_load_settings_from_yaml_and_env(tmp_path, monkeypatch):
     assert s.gemini_api_key == "gk"
 
 
-def test_missing_credentials_raises(tmp_path):
+def test_missing_credentials_raises(tmp_path, monkeypatch):
+    monkeypatch.delenv("COINFILIATE_EMAIL", raising=False)
+    monkeypatch.delenv("COINFILIATE_PASS", raising=False)
     cfg = tmp_path / "config.yaml"
     cfg.write_text(yaml.safe_dump({"networks": ["flexoffers"]}))
-    try:
+    with pytest.raises(ValidationError, match="coinfiliate_email"):
         load_settings(cfg)
-    except Exception as e:
-        assert "COINFILIATE_EMAIL" in str(e) or "coinfiliate_email" in str(e).lower()
-    else:
-        raise AssertionError("expected exception")
+
+
+def test_load_settings_handles_empty_yaml(tmp_path, monkeypatch):
+    monkeypatch.setenv("COINFILIATE_EMAIL", "a@b.com")
+    monkeypatch.setenv("COINFILIATE_PASS", "x")
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("# only comments, no data\n")
+    s = load_settings(cfg)  # would crash with TypeError if None weren't coalesced
+    assert s.networks == ["flexoffers"]  # default
