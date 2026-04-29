@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import asyncio
+import random
 from typing import List, Optional
 from playwright.async_api import BrowserContext, Page
-from coinfiliate.decision import extract_etld1
+from coinfiliate.browser import fresh_context
+from coinfiliate.decision import decide, extract_etld1
 from coinfiliate.logging_setup import get_logger
+from coinfiliate.models import HarvestContext
 
 log = get_logger(__name__)
 
@@ -62,3 +66,69 @@ async def collect_signals(page: Page, context: BrowserContext, affiliate_url: st
         "redirect_chain": redirect_chain,
         "tracker_domains": tracker_domains,
     }
+
+
+async def harvest_shop(store, *, shop_id: int, settings, llm, browser) -> None:
+    """Per-shop harvest: open affiliate URL, collect signals, decide, persist."""
+    shop = next(s for s in await store.list_shops() if s["id"] == shop_id)
+    src = await store.get_harvest_source(shop_id)
+    if not src:
+        await store.update_shop_status(shop_id, "failed", last_error="no harvest_source link")
+        return
+
+    try:
+        async with fresh_context(browser) as ctx:
+            page = await ctx.new_page()
+            sig = await collect_signals(
+                page, ctx, src["affiliate_url"],
+                consent_wait_ms=settings.harvest.consent_wait_ms,
+                networkidle_timeout_s=settings.harvest.networkidle_timeout_seconds,
+            )
+        hctx = HarvestContext(
+            shop_name=shop["name"], network=shop["network"],
+            final_url=sig["final_url"], final_etld1=sig["final_etld1"],
+            cookies=sig["cookies"], redirect_chain=sig["redirect_chain"],
+            tracker_domains=sig["tracker_domains"],
+        )
+        decision = await decide(hctx, llm=llm)
+        ok = decision.primary_cookie_name is not None
+
+        await store.insert_harvest(
+            shop_id=shop_id,
+            final_url=sig["final_url"], final_etld1=sig["final_etld1"],
+            cookies=sig["cookies"], redirect_chain=sig["redirect_chain"],
+            tracker_domains=sig["tracker_domains"],
+            primary_cookie_name=decision.primary_cookie_name,
+            tracking_cookie_names=decision.tracking_cookie_names,
+            checkout_domains=decision.checkout_domains,
+            tracking_cookie_domains=decision.tracking_cookie_domains,
+            decision_source=decision.decision_source,
+            confidence=decision.confidence,
+            llm_rationale=decision.rationale, ok=ok,
+        )
+
+        if ok and decision.confidence >= settings.harvest.review_threshold:
+            await store.update_shop_status(shop_id, "harvested")
+        else:
+            await store.update_shop_status(shop_id, "needs_review")
+    except Exception as e:
+        await store.update_shop_status(shop_id, "failed", last_error=f"{type(e).__name__}: {e}")
+        raise
+
+
+async def run_harvest(store, *, settings, llm, browser) -> None:
+    """Top-level orchestrator: harvest all pending shops with bounded concurrency."""
+    pending = await store.list_shops(status="pending")
+    pending = pending[: settings.runner.max_shops_per_batch]
+    sem = asyncio.Semaphore(settings.runner.max_concurrency)
+
+    async def _one(shop_id: int):
+        async with sem:
+            lo, hi = settings.runner.inter_shop_jitter_ms
+            await asyncio.sleep(random.randint(lo, hi) / 1000)
+            try:
+                await harvest_shop(store, shop_id=shop_id, settings=settings, llm=llm, browser=browser)
+            except Exception as e:
+                log.error("harvest.shop_failed", shop_id=shop_id, err=str(e))
+
+    await asyncio.gather(*[_one(s["id"]) for s in pending])
