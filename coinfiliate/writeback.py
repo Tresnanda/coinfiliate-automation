@@ -4,6 +4,7 @@ import json
 from playwright.async_api import Page
 from coinfiliate.selectors import sel
 from coinfiliate.logging_setup import get_logger
+from coinfiliate.store import Store
 
 log = get_logger(__name__)
 
@@ -52,3 +53,96 @@ async def save_and_verify(page: Page, decision: dict) -> dict:
     # In the real UI, verification means reloading and reading the field back (see Task 17).
     out = await page.locator("#out").inner_text()
     return json.loads(out) if out.strip() else {}
+
+
+async def writeback_shop(
+    store: Store,
+    *,
+    shop_id: int,
+    settings,
+    browser_ctx,
+    dry_run: bool = False,
+) -> None:
+    """Drive the Edit modal for a single harvested shop. Marks shop status accordingly."""
+    shop = next(s for s in await store.list_shops() if s["id"] == shop_id)
+    latest = await store.latest_harvest(shop_id)
+    if not latest or not latest["ok"]:
+        await store.update_shop_status(
+            shop_id, "needs_review",
+            last_error="no ok harvest row for writeback",
+        )
+        return
+
+    decision = {
+        "primary_cookie_name": latest["primary_cookie_name"],
+        "tracking_cookie_names": json.loads(latest["tracking_cookie_names_json"] or "[]"),
+        "checkout_domains":     json.loads(latest["checkout_domains_json"] or "[]"),
+        "tracking_cookie_domains": json.loads(latest["tracking_cookie_domains_json"] or "[]"),
+    }
+
+    try:
+        page = await browser_ctx.new_page()
+        await page.goto(shop["edit_url"])
+
+        # Re-sync if the affiliate-links list is empty (defensive: stale session)
+        await page.locator(sel("editshop.tab_affiliate_links")).first.click()
+        links_count = await page.locator(".link").count()
+        if links_count == 0:
+            from coinfiliate.sync import sync_shop_affiliate_links
+            await sync_shop_affiliate_links(
+                page, shop["edit_url"],
+                network=shop["network"],
+                page_num=settings.sync.page,
+                page_size=settings.sync.page_size,
+            )
+
+        # Select all -> Selected Data -> Edit
+        await page.click(sel("editshop.select_all"))
+        await page.click(sel("editshop.selected_data_dd"))
+        await page.click(sel("editshop.edit_selected"))
+
+        await fill_bulk_edit_modal(page, decision)
+
+        if dry_run:
+            # Cancel instead of save; leave shop status unchanged so a later real run re-tries.
+            await page.locator('button:has-text("Cancel")').first.click()
+            log.info("writeback.dry_run_done", shop_id=shop_id)
+            return
+
+        submitted = await save_and_verify(page, decision)
+
+        if settings.writeback.verify_after_save:
+            if submitted.get("primary_cookie_name") != decision["primary_cookie_name"]:
+                await store.update_shop_status(
+                    shop_id, "failed",
+                    last_error=f"verify mismatch: got {submitted.get('primary_cookie_name')!r}",
+                )
+                return
+
+        await store.update_shop_status(shop_id, "writeback_done")
+    except Exception as e:
+        await store.update_shop_status(shop_id, "failed", last_error=f"{type(e).__name__}: {e}")
+        raise
+
+
+async def run_writeback(
+    store: Store,
+    *,
+    settings,
+    browser_ctx,
+    dry_run: bool = False,
+) -> None:
+    """Top-level orchestrator: writeback all 'harvested' shops sequentially."""
+    shops = await store.list_shops(status="harvested")
+    shops = shops[: settings.runner.max_shops_per_batch]
+    for shop in shops:
+        try:
+            await writeback_shop(
+                store,
+                shop_id=shop["id"],
+                settings=settings,
+                browser_ctx=browser_ctx,
+                dry_run=dry_run,
+            )
+        except Exception as e:
+            log.error("writeback.failed", shop_id=shop["id"], err=str(e))
