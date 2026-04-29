@@ -60,10 +60,56 @@ async def _sync_shops(req):
     return web.Response(status=204)
 
 
+_LINKS_STATE: dict = {}
+
+
+async def _edit_shop_page(req):
+    cfi = req.match_info["cfi"]
+    links = _LINKS_STATE.get(cfi, [])
+    rows = "".join(
+        f'<div class="link" data-link-id="{l["id"]}"><span class="name">{l["name"]}</span>'
+        f'<span class="url">{l["url"]}</span></div>'
+        for l in links
+    )
+    return web.Response(text=f"""
+        <html><body>
+          <button>Affiliate Links</button>
+          <button id="sync-aff">Sync Affiliate Link</button>
+          <div role="dialog" id="sync-aff-modal" style="display:none">
+            <label>Network</label><select role="combobox"><option>flexoffers</option></select>
+            <label>Page</label><input />
+            <label>Page Size</label><input />
+            <button id="sync-now-aff">Sync Now</button>
+          </div>
+          <div id="links">{rows}</div>
+          <script>
+            document.getElementById("sync-aff").onclick = () => {{
+              document.getElementById("sync-aff-modal").style.display = "block";
+            }};
+            document.getElementById("sync-now-aff").onclick = async () => {{
+              await fetch("/admin/partner-shop/{cfi}/sync-links", {{method: "POST"}});
+              location.reload();
+            }};
+          </script>
+        </body></html>
+    """, content_type="text/html")
+
+
+async def _sync_links(req):
+    cfi = req.match_info["cfi"]
+    _LINKS_STATE[cfi] = [
+        {"id": f"{cfi}-L1", "name": "Ad 1", "url": f"https://track.example/g?id={cfi}-1"},
+        {"id": f"{cfi}-L2", "name": "Ad 2", "url": f"https://track.example/g?id={cfi}-2"},
+    ]
+    return web.Response(status=204)
+
+
 def make_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/login", _login_page)
     app.router.add_post("/login", _do_login)
     app.router.add_get("/admin/partner-shop", _partner_shop_page)
     app.router.add_post("/admin/sync-shops", _sync_shops)
+    app.router.add_get("/admin/partner-shop/{cfi}/edit", _edit_shop_page)
+    app.router.add_post("/admin/partner-shop/{cfi}/sync-links", _sync_links)
     return app
