@@ -13,7 +13,7 @@ SELECTORS = {
     "editshop.selected_data_dd":        'button:has-text("Selected Data")',
     "editshop.edit_selected":           'div[role="menu"] >> text=Edit',
     "modal.root":                       'div[role="dialog"]:has-text("Edit Selected Partner Shop Links")',
-    "modal.published_toggle":           'role=switch[name="Published"]',
+    "modal.published_toggle":           'button[role="switch"][name="Published"]',
     "modal.primary_cookie_name":        'label:has-text("Primary Tracking Cookie Name") + * input',
     "modal.checkout_domains_add":       'div:has-text("Checkout Domains") >> button:has-text("Add")',
     "modal.checkout_domain_input_last": 'div:has-text("Checkout Domains") >> input >> nth=-1',
