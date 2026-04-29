@@ -2,13 +2,21 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Optional, Sequence
 import aiosqlite
 
 
 SCHEMA_PATH = Path(__file__).parent.parent / "schema.sql"
 
 VALID_STATUSES = {"pending", "harvested", "writeback_done", "needs_review", "failed"}
+
+VALID_TRANSITIONS = {
+    "pending":        {"harvested", "needs_review", "failed"},
+    "harvested":      {"writeback_done", "needs_review", "failed"},
+    "needs_review":   {"harvested", "failed"},
+    "writeback_done": {"failed"},   # allow retroactive failure marking; otherwise terminal
+    "failed":         {"pending", "harvested", "needs_review"},  # allow re-run after fixing
+}
 
 
 class Store:
@@ -19,6 +27,7 @@ class Store:
     async def init(self) -> None:
         self._conn = await aiosqlite.connect(self.db_path)
         self._conn.row_factory = aiosqlite.Row
+        await self._conn.execute("PRAGMA foreign_keys = ON")
         await self._conn.executescript(SCHEMA_PATH.read_text())
         await self._conn.commit()
 
@@ -47,7 +56,15 @@ class Store:
         return cur.lastrowid
 
     async def update_shop_status(self, shop_id: int, status: str, last_error: Optional[str] = None) -> None:
-        assert status in VALID_STATUSES
+        if status not in VALID_STATUSES:
+            raise ValueError(f"Invalid status {status!r}. Must be one of {sorted(VALID_STATUSES)}")
+        cur = await self._conn.execute("SELECT status FROM shop WHERE id=?", (shop_id,))
+        row = await cur.fetchone()
+        if row is None:
+            raise ValueError(f"Shop id={shop_id} does not exist")
+        current = row["status"]
+        if status != current and status not in VALID_TRANSITIONS.get(current, set()):
+            raise ValueError(f"Illegal status transition {current!r} -> {status!r} for shop id={shop_id}")
         await self._conn.execute(
             "UPDATE shop SET status=?, last_error=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
             (status, last_error, shop_id),

@@ -84,3 +84,25 @@ async def test_insert_harvest_and_list_pending_shops(store):
     latest = await store.latest_harvest(s1)
     assert latest["primary_cookie_name"] == "__kla_id"
     assert json.loads(latest["cookies_json"])[0]["name"] == "__kla_id"
+
+
+async def test_update_shop_status_rejects_invalid_status(store):
+    sid = await store.upsert_shop(coinfiliate_id="x", name="X", network="n",
+                                  advertiser_id=None, website_url=None, edit_url="/")
+    with pytest.raises(ValueError, match="Invalid status"):
+        await store.update_shop_status(sid, "bogus")
+
+
+async def test_update_shop_status_rejects_illegal_transition(store):
+    sid = await store.upsert_shop(coinfiliate_id="x", name="X", network="n",
+                                  advertiser_id=None, website_url=None, edit_url="/")
+    await store.update_shop_status(sid, "harvested")
+    await store.update_shop_status(sid, "writeback_done")
+    with pytest.raises(ValueError, match="Illegal status transition"):
+        await store.update_shop_status(sid, "pending")
+
+
+async def test_get_harvest_source_returns_none_when_no_source(store):
+    sid = await store.upsert_shop(coinfiliate_id="x", name="X", network="n",
+                                  advertiser_id=None, website_url=None, edit_url="/")
+    assert await store.get_harvest_source(sid) is None
