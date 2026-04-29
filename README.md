@@ -1,99 +1,120 @@
 # Coinfiliate Automation
 
-Automated cookie harvester for the [Coinfiliate](https://www.coinfiliate.com) Partner Shop dashboard. Logs into your Coinfiliate account, discovers shops that still need tracking configuration, follows each affiliate link in a real browser to capture the network's tracking cookie and final destination domain, and writes those values back to the dashboard.
+Automated cookie harvester for the Coinfiliate Partner Shop dashboard. Logs in, syncs Partner Shops + their affiliate links, opens each affiliate URL in an isolated browser context to capture tracking cookies, decides the primary cookie via heuristics + LLM fallback, and writes the result back into the Edit Selected Partner Shop Links modal.
 
-Built with [Playwright](https://playwright.dev/python/) (async API) on headless Chromium.
+Built on Playwright (async) + SQLite + Typer. LLM is pluggable: OpenAI or Gemini.
 
-## How it works
+## Architecture
 
-1. **Login** — authenticates against `https://www.coinfiliate.com/login` with email + password.
-2. **Discover pending shops** — scrapes the Partner Shop admin table for shops that still need a primary cookie + domain configured.
-3. **Harvest tracking cookie** — for each shop, opens the affiliate URL in a fresh tab, auto-clicks common cookie-consent banners ("Accept", "Allow All", etc.), waits for tracking scripts to fire (`networkidle`), and extracts all cookies from the browser context.
-4. **Heuristic match** — identifies the primary affiliate cookie by matching well-known tracking keywords:
-   `pjnclick`, `irclick`, `ir_`, `_ck_`, `_wg_`, `affiliateid`, `clickid`, `cid`, `awc`, `fpc`, `_fbp`, `impact`.
-5. **Write back** — navigates to the shop's edit form and fills `TrackingPrimaryCookieAffiliate` (cookie name) and `DomainWebsite` (final URL domain), then submits.
+Three-phase pipeline; each phase reads/writes SQLite (`state.db`):
 
-When the heuristic fails, the script surfaces the full cookie list so a follow-up LLM fallback can be added later.
+```
+sync       Pull Partner Shops + affiliate links into SQLite (status='pending')
+harvest    For each pending shop: open affiliate URL, capture cookies + redirect
+           chain, run heuristic -> LLM decision, write harvest row
+           (status='harvested' or 'needs_review' or 'failed')
+writeback  For each harvested shop: drive the Edit modal, save, verify
+           (status='writeback_done')
+run        sync && harvest && writeback
+doctor     Print all DOM selectors used (sanity check)
+review     List 'needs_review' shops for manual decision
+```
 
-## Requirements
-
-- Python 3.10+
-- Chromium (installed automatically by Playwright)
+See `docs/superpowers/specs/2026-04-24-coinfiliate-automation-design.md` for the full design.
 
 ## Setup
 
 ```bash
 python -m venv venv
-# macOS / Linux
-source venv/bin/activate
-# Windows (PowerShell)
-venv\Scripts\Activate.ps1
+source venv/bin/activate           # macOS/Linux
+venv\Scripts\Activate.ps1          # Windows PowerShell
 
 pip install -r requirements.txt
 playwright install chromium
+cp .env.example .env               # then edit:
+#   COINFILIATE_EMAIL=...
+#   COINFILIATE_PASS=...
+#   OPENAI_API_KEY=...   (or GEMINI_API_KEY=... if you set llm.provider: gemini)
+```
+
+## Usage
+
+```bash
+python main.py run                  # full pipeline
+python main.py sync                 # phase 1 only
+python main.py harvest              # phase 2 only
+python main.py writeback            # phase 3 only
+python main.py writeback --dry-run  # walk modal but Cancel instead of Save
+python main.py doctor               # print selectors
+python main.py review               # list needs_review shops
+
+python main.py run --limit 5        # cap to 5 shops per batch
 ```
 
 ## Configuration
 
-Copy `.env.example` to `.env` and fill in your Coinfiliate credentials:
+`config.yaml` (checked in with sensible defaults):
+
+```yaml
+networks: ["flexoffers"]            # extend with awin/impact/cj when ready
+runner:
+  max_shops_per_batch: 50
+  max_concurrency: 4
+harvest:
+  review_threshold: 0.0             # 0.0 = fully autonomous; raise to gate low-confidence
+writeback:
+  verify_after_save: true
+llm:
+  provider: "openai"                # or "gemini"
+  model: "gpt-4o-mini"
+```
+
+## Tests
 
 ```bash
-cp .env.example .env
+pytest                              # everything (unit + integration)
+pytest -m unit                      # fast tests only (no browser)
+pytest -m integration               # browser-driven tests against local fixture servers
 ```
 
-```dotenv
-COINFILIATE_EMAIL="your_coinfiliate_email@example.com"
-COINFILIATE_PASS="your_coinfiliate_password"
-```
-
-Credentials are read from environment variables at runtime. `.env` is git-ignored.
-
-## Usage
-
-Export the credentials (or `source` your `.env`) and run:
-
-```bash
-export COINFILIATE_EMAIL="you@example.com"
-export COINFILIATE_PASS="your_password"
-python main.py
-```
-
-By default the browser runs **visible** (`headless=False`) to make debugging selectors easier. Flip the flag in `main.py` once selectors are stable:
-
-```python
-harvester = CookieHarvester(headless=True)
-```
-
-## Project structure
+## Project layout
 
 ```
-.
-├── main.py             # CookieHarvester class + entrypoint
-├── requirements.txt    # Python dependencies
-├── .env.example        # Template for credentials
-└── README.md
+coinfiliate/
+  cli.py              # Typer commands
+  config.py           # pydantic-settings loader (yaml + env)
+  store.py            # SQLite schema + CRUD
+  selectors.py        # all DOM selectors centralized
+  browser.py          # Playwright session + context factory
+  sync.py             # phase 1: login, partner-shop sync, affiliate-link sync
+  harvest.py          # phase 2: signal collection, decision, store
+  writeback.py        # phase 3: drive Edit modal, save, verify
+  decision.py         # heuristic matchers + decide() orchestrator
+  models.py           # HarvestContext / HarvestDecision dataclasses
+  llm/
+    base.py           # CookieAnalyzer Protocol
+    prompt.py         # system prompt + user prompt builder
+    openai_client.py
+    gemini_client.py  # uses google-genai SDK
+  logging_setup.py    # structlog config
+schema.sql            # SQLite DDL
+config.yaml           # runtime defaults
+tests/
+  unit/               # fast, no browser
+  integration/        # Playwright + local aiohttp fixture servers
+  fixtures/           # fake servers + saved HTML
+docs/
+  superpowers/specs/  # design spec
+  superpowers/plans/  # implementation plan
+  tutorial-images/    # extracted from the source DOCX
 ```
 
 ## Status & known limitations
 
-- **Table extraction selectors are placeholders.** `get_pending_shops()` currently returns an empty list — the DOM selectors for the Partner Shop table rows (`.shop-name`, `.affiliate-link`, `.edit-btn`) need to be mapped to the live dashboard before the script can discover shops.
-- **Edit-form selectors** (`input[name="TrackingPrimaryCookieAffiliate"]`, `input[name="DomainWebsite"]`) are best-effort guesses based on WPS tutorial screenshots and may need adjusting.
-- **No LLM fallback yet.** When the cookie heuristic misses, the script logs the failure; full cookie context is already collected and ready to hand off to an LLM if needed.
-- **Consent handling** is intentionally simple — only English "Accept"-style buttons are clicked.
-
-## Development
-
-Run directly with a visible browser to inspect and tune selectors:
-
-```python
-harvester = CookieHarvester(headless=False)
-```
-
-Use Playwright's inspector to record selectors against the live dashboard:
-
-```bash
-playwright codegen https://www.coinfiliate.com/login
-```
+- Selectors are mapped from the design-doc tutorial screenshots; any drift in the live Coinfiliate UI will require updates in `coinfiliate/selectors.py`. Run `python main.py doctor` to inspect the current selector set.
+- The fake server tests verify the sync/harvest/writeback flows against minimal HTML fixtures. Behavior on the live dashboard should be verified with `python main.py run --limit 1 --dry-run` before doing a full batch.
+- Step 8 of the original tutorial ("simulate checkout") is not automated — we use the eTLD+1 of the landed page as both `Checkout Domains` and `Tracking Cookie Domains`. The LLM fallback can override this when it spots distinct tracker subdomains.
+- Login uses a persistent `user_data_dir` at `.playwright/coinfiliate/` so reruns within the day skip re-login. Delete that directory to force re-auth.
 
 ## License
 
