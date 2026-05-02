@@ -207,45 +207,58 @@ async def sync_shop_affiliate_links(page: Page, shop_edit_url: str, *, network: 
     except Exception:
         await page.wait_for_load_state("networkidle", timeout=timeout_ms)
 
-    # Scrape the links list. The Edit page renders each link as a Radix
-    # Accordion item. Prefer the explicit-id pattern when present, else fall
-    # back to the live DOM structure.
-    items = page.locator('[data-slot="accordion-item"]')
-    if await items.count() == 0:
-        items = page.locator('#links .link, .link')
+    # The Edit page is Convex-backed and the affiliate-link list streams in
+    # asynchronously after the modal closes. Wait for the first link card to
+    # render before scraping.
+    items = page.locator('[data-slot="collapsible"]')
+    try:
+        await items.first.wait_for(state="visible", timeout=20_000)
+    except Exception:
+        log.info("sync_links.empty", shop_edit_url=shop_edit_url)
+        return []
+
     count = await items.count()
+    log.info("sync_links.found", count=count)
     out = []
     for i in range(count):
         it = items.nth(i)
-        # Prefer explicit fixture id, else try to read from data attributes.
-        link_id = await it.get_attribute("data-link-id") or ""
-        if not link_id:
-            link_id = await it.get_attribute("value") or ""
-        if not link_id:
-            link_id = f"link-{i}"
-        # Name: first heading-like element in the accordion trigger.
-        name_text = ""
-        for sel_try in ['button[data-slot="accordion-trigger"]', '.name', 'h3', 'h4']:
-            loc = it.locator(sel_try).first
-            if await loc.count():
-                name_text = (await loc.inner_text()).strip()
-                if name_text:
-                    break
-        # Affiliate URL: read input[placeholder*="Affiliate URL"] or any text
-        # that starts with http(s).
+        # Title is in the first collapsible-trigger <p>; strip the "published"
+        # pill text that shares the same element.
+        title_p = it.locator('[data-slot="collapsible-trigger"]').first
+        full_text = (await title_p.inner_text()).strip()
+        # The pill text is "published" / "draft" appended to the name.
+        for badge in ("published", "Published", "draft", "Draft"):
+            if full_text.endswith(badge):
+                full_text = full_text[: -len(badge)].strip()
+                break
+        name_text = full_text
+
+        # Expand to read the Affiliate URL input. We open by clicking the
+        # chevron button (the second collapsible-trigger), then read any
+        # input whose value starts with "http".
+        chevron = it.locator('button[data-slot="collapsible-trigger"]').first
+        await chevron.click()
+        # Wait for inputs to render inside the now-open collapsible.
+        try:
+            await it.locator('input').first.wait_for(state="visible", timeout=5_000)
+        except Exception:
+            pass
         url_text = ""
-        url_input = it.locator('input').filter(has_text=" ")  # placeholder seeded
-        # Simpler: read any input value that looks like a URL inside the item.
+        link_id = ""
         n_inputs = await it.locator('input').count()
         for j in range(n_inputs):
             val = await it.locator('input').nth(j).input_value()
-            if val.startswith("http"):
+            if val.startswith("http") and not url_text:
                 url_text = val
-                break
-        if not url_text:
-            url_loc = it.locator('.url').first
-            if await url_loc.count():
-                url_text = (await url_loc.inner_text()).strip()
+            # Heuristic: the FlexOffers Link ID looks like "156099.14723.864801"
+            # — three dot-separated number runs. Capture the first match.
+            if not link_id and val and val.count(".") >= 2 and val.replace(".", "").isdigit():
+                link_id = val
+        if not link_id:
+            link_id = f"link-{i}"
+
+        # Collapse again so the next iteration's click hits a known state.
+        await chevron.click()
         out.append({
             "link_id": link_id,
             "name": name_text,

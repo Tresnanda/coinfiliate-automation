@@ -9,35 +9,59 @@ from coinfiliate.store import Store
 log = get_logger(__name__)
 
 
+async def _fill_list_field(dlg, label_text: str, values: list) -> None:
+    """Click '+ Add' inside the section labeled `label_text`, fill each value into
+    the newly-appended input.
+
+    Live DOM shape:
+      <div class="...rounded-lg">          <- section (bordered card)
+        <div class="flex ...">             <- header
+          <label>Tracking Cookie Names</label>
+          <button>+ Add</button>
+        </div>
+        <div class="space-y-3">             <- list container; inputs appended here
+        </div>
+      </div>
+    """
+    # Find the label, walk to its nearest .rounded-lg ancestor (the section card).
+    section = (
+        dlg.locator(f'label:text-is("{label_text}")')
+        .first.locator('xpath=ancestor::div[contains(@class, "rounded-lg")][1]')
+    )
+    add_btn = section.locator('button:has-text("Add")').first
+    for value in values:
+        await add_btn.click()
+        new_input = section.locator('input').last
+        await new_input.wait_for(state="visible", timeout=5_000)
+        await new_input.fill(value)
+
+
 async def fill_bulk_edit_modal(page: Page, decision: dict) -> None:
-    """Fill all four tracking-related fields + Published toggle. Idempotent on re-runs."""
-    dlg = page.locator(sel("modal.root"))
+    """Fill the four tracking-related fields in the live bulk-edit modal.
+
+    Live modal labels: Name, Network, Advertiser ID, Link ID, Affiliate URL,
+    User Commission Rate (%), Coupon Code, Primary Tracking Cookie Name,
+    Checkout Domains (list), Tracking Cookie Names (list), Tracking Cookie
+    Domains (list). There is no Published toggle in the modal — the docx
+    tutorial showed one but the current UI omits it; per-shop publishing is
+    governed by the outer-page Published button instead.
+    """
+    dlg = page.locator(
+        'div[role="dialog"]:has-text("Edit Selected Partner Shop Links")'
+    ).first
     await dlg.wait_for(state="visible", timeout=10_000)
 
-    # Published toggle: turn ON if currently OFF
-    toggle = dlg.locator(sel("modal.published_toggle"))
-    if await toggle.get_attribute("aria-checked") != "true":
-        await toggle.click()
-
-    # Primary cookie name
+    # Primary cookie name: input directly after its <label>.
     primary_name = decision.get("primary_cookie_name")
     if primary_name:
-        await dlg.locator(sel("modal.primary_cookie_name")).fill(primary_name)
+        primary_input = dlg.locator(
+            'label:text-is("Primary Tracking Cookie Name") + input'
+        ).first
+        await primary_input.fill(primary_name)
 
-    # Tracking cookie names list
-    for name in decision.get("tracking_cookie_names", []):
-        await dlg.locator(sel("modal.tracking_names_add")).click()
-        await dlg.locator(sel("modal.tracking_names_input_last")).fill(name)
-
-    # Checkout domains list
-    for d in decision.get("checkout_domains", []):
-        await dlg.locator(sel("modal.checkout_domains_add")).click()
-        await dlg.locator(sel("modal.checkout_domain_input_last")).fill(d)
-
-    # Tracking cookie domains list
-    for d in decision.get("tracking_cookie_domains", []):
-        await dlg.locator(sel("modal.tracking_domains_add")).click()
-        await dlg.locator(sel("modal.tracking_domains_input_last")).fill(d)
+    await _fill_list_field(dlg, "Tracking Cookie Names",   decision.get("tracking_cookie_names", []))
+    await _fill_list_field(dlg, "Checkout Domains",        decision.get("checkout_domains", []))
+    await _fill_list_field(dlg, "Tracking Cookie Domains", decision.get("tracking_cookie_domains", []))
 
 
 async def save_and_verify(page: Page, decision: dict) -> dict:
@@ -80,32 +104,52 @@ async def writeback_shop(
         "tracking_cookie_domains": json.loads(latest["tracking_cookie_domains_json"] or "[]"),
     }
 
+    # Resolve relative URL stored by the sync phase to an absolute one.
+    edit_url = shop["edit_url"]
+    if edit_url.startswith("/"):
+        edit_url = f"https://www.coinfiliate.com{edit_url}"
+
     try:
         page = await browser_ctx.new_page()
-        await page.goto(shop["edit_url"])
+        await page.goto(edit_url, wait_until="domcontentloaded")
 
-        # Re-sync if the affiliate-links list is empty (defensive: stale session)
-        await page.locator(sel("editshop.tab_affiliate_links")).first.click()
-        links_count = await page.locator(".link").count()
-        if links_count == 0:
+        # The Affiliate Links tab is the default; clicking it is idempotent but
+        # we wait for at least one collapsible card to render so we know the
+        # Convex data has hydrated before we reach for Select All.
+        try:
+            await page.locator('[data-slot="collapsible"]').first.wait_for(
+                state="visible", timeout=20_000
+            )
+        except Exception:
+            # No links: fall back to a per-shop sync to fetch them now.
             from coinfiliate.sync import sync_shop_affiliate_links
             await sync_shop_affiliate_links(
-                page, shop["edit_url"],
+                page, edit_url,
                 network=shop["network"],
                 page_num=settings.sync.page,
                 page_size=settings.sync.page_size,
             )
 
-        # Select all -> Selected Data -> Edit
-        await page.click(sel("editshop.select_all"))
-        await page.click(sel("editshop.selected_data_dd"))
-        await page.click(sel("editshop.edit_selected"))
+        # Select All is rendered as a Radix checkbox button that's a sibling of
+        # the "Select All" text. Walk up to the wrapping div and pick the button.
+        select_all_btn = page.locator(
+            'div:has(> p:text-is("Select All")) > button[role="checkbox"]'
+        ).first
+        await select_all_btn.wait_for(state="visible", timeout=10_000)
+        await select_all_btn.click()
+        # Then open the Selected Data action menu and click Edit.
+        await page.locator('button:has-text("Selected Data")').click()
+        await page.locator('[role="menuitem"]').filter(has_text="Edit").first.click()
 
         await fill_bulk_edit_modal(page, decision)
 
         if dry_run:
             # Cancel instead of save; leave shop status unchanged so a later real run re-tries.
-            await page.locator('button:has-text("Cancel")').first.click()
+            # Scope to the modal — the outer Edit page also has a Cancel button.
+            await page.locator(
+                'div[role="dialog"]:has-text("Edit Selected Partner Shop Links") '
+                'button:has-text("Cancel")'
+            ).first.click()
             log.info("writeback.dry_run_done", shop_id=shop_id)
             return
 
