@@ -137,8 +137,11 @@ async def writeback_shop(
         ).first
         await select_all_btn.wait_for(state="visible", timeout=10_000)
         await select_all_btn.click()
-        # Then open the Selected Data action menu and click Edit.
-        await page.locator('button:has-text("Selected Data")').click()
+        # The "Selected Data (N)" dropdown trigger only appears once at least one
+        # row is selected; wait for it explicitly before clicking.
+        selected_data = page.locator('button:has-text("Selected Data")').first
+        await selected_data.wait_for(state="visible", timeout=15_000)
+        await selected_data.click()
         await page.locator('[role="menuitem"]').filter(has_text="Edit").first.click()
 
         await fill_bulk_edit_modal(page, decision)

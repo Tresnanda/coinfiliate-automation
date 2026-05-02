@@ -116,8 +116,8 @@ async def sync_partner_shops(page: Page, *, network: str, page_num: int, page_si
     log.info("sync_shops.ok")
 
 
-async def scrape_shops(page: Page) -> list:
-    """Scrape the Partner Shop table.
+async def _scrape_current_page(page: Page) -> list:
+    """Scrape just the rows currently visible on the Partner Shop table.
 
     Live DOM uses Radix Table + a per-row dropdown menu for Edit. We extract
     name/network/status from cell text; the unique id and edit href come from
@@ -135,26 +135,18 @@ async def scrape_shops(page: Page) -> list:
         status = (await cells.nth(4).inner_text()).strip()
 
         # Open the per-row dropdown to read the Edit href. Radix portals the
-        # menu content to body and only one menu can be open at a time, so we
-        # must explicitly wait for the previous menu to dismiss before opening
-        # the next one — otherwise we read stale data.
+        # menu content to body and only one menu can be open at a time.
         menu_btn = cells.nth(5).locator('button[data-slot="dropdown-menu-trigger"]')
         await menu_btn.click()
-        # Edit menu item is the only <a role="menuitem"> in the popover; View
-        # and Delete are <div role="menuitem">. Targeting the anchor avoids
-        # text-matching surprises across i18n.
         edit_item = page.locator('a[role="menuitem"]').first
         await edit_item.wait_for(state="visible", timeout=5_000)
         edit_url = await edit_item.get_attribute("href") or ""
-        # Derive a stable id from the URL pattern /admin/partner-shop/edit/<slug>.
         coinfiliate_id = ""
         if edit_url:
             import re
             m = re.search(r"/partner-shop/edit/([^/?#]+)", edit_url)
             if m:
                 coinfiliate_id = m.group(1)
-        # Close the menu and wait for it to actually leave the DOM before we
-        # advance to the next row.
         await page.keyboard.press("Escape")
         try:
             await edit_item.wait_for(state="hidden", timeout=2_000)
@@ -168,6 +160,56 @@ async def scrape_shops(page: Page) -> list:
             "status": status,
             "edit_url": edit_url,
         })
+    return out
+
+
+async def _go_to_next_page(page: Page) -> bool:
+    """Click the Pagination Next button. Returns False if there is no next page."""
+    next_btn = page.locator('button[aria-label="Next page"]')
+    # When disabled, Radix sets the disabled attribute; treat that as no-more-pages.
+    if await next_btn.get_attribute("disabled") is not None:
+        return False
+    await next_btn.click()
+    # Wait for the table to settle on the next page (header + at least 1 body row).
+    await page.locator(
+        'tbody[data-slot="table-body"] tr[data-slot="table-row"]'
+    ).first.wait_for(state="visible", timeout=10_000)
+    return True
+
+
+async def scrape_shops(
+    page: Page,
+    *,
+    max_pages: int = 1,
+    matches: callable = None,
+    target_count: int | None = None,
+) -> list:
+    """Scrape one or more pages of the Partner Shop table.
+
+    Args:
+      max_pages: hard cap on pages to walk (1 = current page only).
+      matches: optional predicate(shop_dict) -> bool. Only matching rows count
+        toward target_count and are returned.
+      target_count: stop early once `matches` has produced this many shops.
+
+    The Partner Shop list uses client-side pagination (10 rows per page, no
+    page-size selector). To collect more than 10 rows we walk pages via the
+    Pagination "Next" button.
+    """
+    out = []
+    pages_walked = 0
+    while pages_walked < max_pages:
+        rows_on_page = await _scrape_current_page(page)
+        for s in rows_on_page:
+            if matches is None or matches(s):
+                out.append(s)
+                if target_count is not None and len(out) >= target_count:
+                    return out
+        pages_walked += 1
+        if pages_walked >= max_pages:
+            break
+        if not await _go_to_next_page(page):
+            break
     return out
 
 
@@ -277,6 +319,10 @@ async def run_sync(settings, store, browser_ctx) -> None:
         password=settings.coinfiliate_pass,
     )
 
+    target_status = (settings.sync.target_status or "").strip().lower()
+    target_count = settings.runner.max_shops_per_batch
+    max_pages = settings.sync.max_pages
+
     for network in settings.networks:
         await page.goto("https://www.coinfiliate.com/admin/partner-shop")
         await sync_partner_shops(
@@ -284,13 +330,31 @@ async def run_sync(settings, store, browser_ctx) -> None:
             page_num=settings.sync.page,
             page_size=settings.sync.page_size,
         )
-        shops = await scrape_shops(page)
-        # Only persist rows that actually belong to the network we synced for.
-        # The shop list displays all shops across all networks; "-" means none.
-        for s in shops:
+        # Walk pages and only persist rows that match (network, target_status).
+        # Stop once we have target_count matching shops queued.
+        already = {s["coinfiliate_id"] for s in await store.list_shops()}
+
+        def _matches(s, _network=network, _status=target_status):
             row_network = (s.get("network") or "").strip().lower()
-            if row_network != network.lower():
-                continue
+            if row_network != _network.lower():
+                return False
+            if _status:
+                row_status = (s.get("status") or "").strip().lower()
+                if _status not in row_status:
+                    return False
+            # Skip ones we've already persisted from a prior run.
+            if s.get("coinfiliate_id") in already:
+                return False
+            return True
+
+        shops = await scrape_shops(
+            page,
+            max_pages=max_pages,
+            matches=_matches,
+            target_count=target_count,
+        )
+        log.info("scrape_shops.collected", network=network, count=len(shops))
+        for s in shops:
             await store.upsert_shop(
                 coinfiliate_id=s["coinfiliate_id"], name=s["name"],
                 network=network, advertiser_id=None, website_url=None,

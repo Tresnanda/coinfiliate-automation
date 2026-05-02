@@ -11,6 +11,14 @@ class SyncConfig(BaseModel):
     page: int = 1
     page_size: int = 100
     selectable_fields: str = "all"
+    # Only persist Partner Shops whose status badge contains this string
+    # (case-insensitive). Empty string means "any". Coinfiliate's published
+    # shops already have working tracking config, so the default scopes
+    # automation to Drafts only.
+    target_status: str = "Draft"
+    # Hard cap on Partner Shop pages walked per network. The list paginates
+    # client-side at 10 rows/page; large accounts can have 700+ rows.
+    max_pages: int = 80
 
 
 class RunnerConfig(BaseModel):

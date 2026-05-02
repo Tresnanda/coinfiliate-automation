@@ -4,6 +4,8 @@ sync:
   page: 1
   page_size: 100
   selectable_fields: "all"
+  target_status: "Draft"   # only persist shops whose status badge contains this; "" = any
+  max_pages: 80            # cap on Partner Shop list pages walked per network
 
 runner:
   max_shops_per_batch: 50
