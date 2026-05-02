@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 SELECTORS = {
-    "login.email":                      'input[type="email"]',
-    "login.password":                   'input[type="password"]',
-    "login.submit":                     'button[type="submit"]',
+    # Coinfiliate uses Clerk for auth. /login redirects to /sign-in.
+    "login.email":                      'input[name="identifier"]',
+    "login.password":                   'input[name="password"]',
+    "login.submit":                     'button[data-localization-key="formButtonPrimary"]',
     "shoplist.sync_btn":                'button:has-text("Sync Partner Shop")',
     "shoplist.row":                     'table tbody tr',
     "shoplist.edit_action":             'text=Edit',

@@ -32,6 +32,9 @@ def test_load_settings_from_yaml_and_env(tmp_path, monkeypatch):
 def test_missing_credentials_raises(tmp_path, monkeypatch):
     monkeypatch.delenv("COINFILIATE_EMAIL", raising=False)
     monkeypatch.delenv("COINFILIATE_PASS", raising=False)
+    # Run from a directory with no .env file so pydantic-settings can't pick
+    # up real credentials from the project root.
+    monkeypatch.chdir(tmp_path)
     cfg = tmp_path / "config.yaml"
     cfg.write_text(yaml.safe_dump({"networks": ["flexoffers"]}))
     with pytest.raises(ValidationError, match="coinfiliate_email"):
