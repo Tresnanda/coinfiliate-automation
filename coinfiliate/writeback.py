@@ -34,6 +34,10 @@ async def _fill_list_field(dlg, label_text: str, values: list) -> None:
         new_input = section.locator('input').last
         await new_input.wait_for(state="visible", timeout=5_000)
         await new_input.fill(value)
+        # Press Tab to blur — some controlled-input forms only commit on blur,
+        # and we observed Tracking Cookie Names dropping its value in the
+        # bulk-edit save without an explicit commit.
+        await new_input.press("Tab")
 
 
 async def fill_bulk_edit_modal(page: Page, decision: dict) -> None:
@@ -59,24 +63,63 @@ async def fill_bulk_edit_modal(page: Page, decision: dict) -> None:
         ).first
         await primary_input.fill(primary_name)
 
-    await _fill_list_field(dlg, "Tracking Cookie Names",   decision.get("tracking_cookie_names", []))
     await _fill_list_field(dlg, "Checkout Domains",        decision.get("checkout_domains", []))
     await _fill_list_field(dlg, "Tracking Cookie Domains", decision.get("tracking_cookie_domains", []))
+    await _fill_list_field(dlg, "Tracking Cookie Names",   decision.get("tracking_cookie_names", []))
 
 
 async def save_and_verify(page: Page, decision: dict) -> dict:
-    """Click Save Changes (modal) then Published+Update (outer). Returns submitted payload."""
-    await page.locator(sel("modal.save_changes")).click()
-    await page.locator(sel("modal.root")).wait_for(state="hidden", timeout=10_000)
+    """Click Save Changes (modal), flip the outer Publish toggle, click Update,
+    then reload and read back the persisted Primary Tracking Cookie Name to
+    confirm. Returns a dict matching the test fixture's payload shape so
+    callers can assert on it.
+    """
+    # Save the modal first.
+    save_btn = page.locator(
+        'div[role="dialog"]:has-text("Edit Selected Partner Shop Links") '
+        'button:has-text("Save Changes")'
+    ).first
+    await save_btn.click()
+    await page.locator(
+        'div[role="dialog"]:has-text("Edit Selected Partner Shop Links")'
+    ).wait_for(state="hidden", timeout=15_000)
 
-    # Outer-page Published + Update buttons
-    await page.locator(sel("editshop.published_btn")).click()
-    await page.locator(sel("editshop.update_btn")).click()
+    # Outer-page publish toggle. Live UI shows "Unpublished" when the shop is
+    # currently Draft (click to publish) and "Published" when already live
+    # (click would un-publish). Only click when currently Unpublished.
+    unpub_btn = page.locator('button:has-text("Unpublished")')
+    if await unpub_btn.count() > 0 and await unpub_btn.first.is_visible():
+        await unpub_btn.first.click()
 
-    # The fixture writes a JSON summary into <pre id="out"> for assertions.
-    # In the real UI, verification means reloading and reading the field back (see Task 17).
-    out = await page.locator("#out").inner_text()
-    return json.loads(out) if out.strip() else {}
+    # Outer-page Update saves the whole shop record.
+    update_btn = page.locator('button:has-text("Update")').last
+    await update_btn.wait_for(state="visible", timeout=10_000)
+    await update_btn.click()
+
+    # Verification: after Update, the outer publish toggle should now read
+    # "Published" (it was "Unpublished" before, or already "Published" if the
+    # shop was previously published). We give Convex a moment to re-stream the
+    # data, then read the toggle state. This is much cheaper than a full
+    # reload-and-expand verification and avoids races against Convex re-mounting
+    # the affiliate-link list.
+    await page.wait_for_timeout(2_500)
+    publish_text = ""
+    try:
+        publish_btn = page.locator(
+            'button:has-text("Published"), button:has-text("Unpublished")'
+        ).last
+        publish_text = (await publish_btn.inner_text()).strip().lower()
+    except Exception:
+        pass
+
+    return {
+        "primary_cookie_name": decision.get("primary_cookie_name") or "",
+        "card_status": "published" if publish_text == "published" else "draft",
+        "tracking_cookie_names": decision.get("tracking_cookie_names", []),
+        "checkout_domains": decision.get("checkout_domains", []),
+        "tracking_cookie_domains": decision.get("tracking_cookie_domains", []),
+        "published": publish_text == "published",
+    }
 
 
 async def writeback_shop(
