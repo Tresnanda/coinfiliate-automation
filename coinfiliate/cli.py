@@ -7,7 +7,7 @@ import typer
 from coinfiliate.config import load_settings
 from coinfiliate.store import Store
 from coinfiliate.browser import BrowserSession, harvest_browser
-from coinfiliate.logging_setup import configure, get_logger
+from coinfiliate.logging_setup import configure, get_logger, log_file_path
 
 app = typer.Typer(no_args_is_help=True)
 log = get_logger(__name__)
@@ -43,7 +43,15 @@ def _make_llm(settings):
 
 @app.command()
 def sync(config: Path = Path("config.yaml"), db: Path = Path("state.db"),
-         limit: Optional[int] = typer.Option(None, help="Cap shops processed; overrides max_shops_per_batch")):
+         limit: Optional[int] = typer.Option(None, help="Cap shops processed; overrides max_shops_per_batch"),
+         from_page: Optional[int] = typer.Option(
+             None, "--from-page",
+             help="1-indexed Partner Shop list page to start from (overrides sync.from_page)",
+         ),
+         to_page: Optional[int] = typer.Option(
+             None, "--to-page",
+             help="1-indexed inclusive last page (overrides sync.to_page)",
+         )):
     """Pull Partner Shops + affiliate links into SQLite."""
     from coinfiliate.sync import run_sync
 
@@ -51,6 +59,10 @@ def sync(config: Path = Path("config.yaml"), db: Path = Path("state.db"),
         s, store = _settings_and_store(config, db)
         if limit is not None:
             s.runner.max_shops_per_batch = limit
+        if from_page is not None:
+            s.sync.from_page = from_page
+        if to_page is not None:
+            s.sync.to_page = to_page
         await store.init()
         try:
             async with BrowserSession(Path(".playwright/coinfiliate")) as ctx:
@@ -106,11 +118,41 @@ def writeback(config: Path = Path("config.yaml"), db: Path = Path("state.db"),
 @app.command()
 def run(config: Path = Path("config.yaml"), db: Path = Path("state.db"),
         limit: Optional[int] = typer.Option(None),
+        from_page: Optional[int] = typer.Option(
+            None, "--from-page",
+            help="1-indexed Partner Shop list page to start from (sync phase only)",
+        ),
+        to_page: Optional[int] = typer.Option(
+            None, "--to-page",
+            help="1-indexed inclusive last page (sync phase only)",
+        ),
         dry_run: bool = typer.Option(False, "--dry-run")):
     """sync -> harvest -> writeback."""
-    sync(config=config, db=db, limit=limit)
+    # Configure logging up-front so the log file path is known before any
+    # subcommand body runs, and so we can announce it.
+    s, _ = _settings_and_store(config, db)
+    log.info(
+        "pipeline.start",
+        log_file=str(log_file_path()), limit=limit,
+        from_page=from_page, to_page=to_page, dry_run=dry_run,
+    )
+    sync(config=config, db=db, limit=limit, from_page=from_page, to_page=to_page)
     harvest(config=config, db=db, limit=limit)
     writeback(config=config, db=db, limit=limit, dry_run=dry_run)
+
+    async def _summary():
+        store = Store(db)
+        await store.init()
+        try:
+            shops = await store.list_shops()
+            by_status: dict[str, int] = {}
+            for shop in shops:
+                by_status[shop["status"]] = by_status.get(shop["status"], 0) + 1
+            log.info("pipeline.summary", total=len(shops), by_status=by_status,
+                     log_file=str(log_file_path()))
+        finally:
+            await store.close()
+    asyncio.run(_summary())
 
 
 @app.command()

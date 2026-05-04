@@ -181,13 +181,20 @@ async def scrape_shops(
     page: Page,
     *,
     max_pages: int = 1,
+    from_page: int = 1,
+    to_page: int | None = None,
     matches: callable = None,
     target_count: int | None = None,
 ) -> list:
     """Scrape one or more pages of the Partner Shop table.
 
     Args:
-      max_pages: hard cap on pages to walk (1 = current page only).
+      max_pages: hard cap on pages to walk *from from_page*. Acts as a safety
+        net when to_page is None.
+      from_page: 1-indexed list page to start scraping from. The function will
+        click "Next" (from_page - 1) times before reading any rows.
+      to_page: 1-indexed inclusive last page. None means "no upper bound beyond
+        max_pages".
       matches: optional predicate(shop_dict) -> bool. Only matching rows count
         toward target_count and are returned.
       target_count: stop early once `matches` has produced this many shops.
@@ -196,27 +203,50 @@ async def scrape_shops(
     page-size selector). To collect more than 10 rows we walk pages via the
     Pagination "Next" button.
     """
+    # Walk to the requested start page first. If we run out of pages before
+    # reaching it, there's nothing to scrape.
+    for step in range(max(0, from_page - 1)):
+        if not await _go_to_next_page(page):
+            log.info(
+                "scrape_shops.exhausted_before_start",
+                from_page=from_page, reached=step + 1,
+            )
+            return []
+
+    # Effective page budget: the smaller of max_pages and the to_page span.
+    if to_page is None:
+        budget = max_pages
+    else:
+        budget = min(max_pages, max(0, to_page - from_page + 1))
+
     out = []
     pages_walked = 0
-    while pages_walked < max_pages:
+    current_page_num = from_page
+    while pages_walked < budget:
         rows_on_page = await _scrape_current_page(page)
+        log.info(
+            "scrape_shops.page",
+            page_num=current_page_num, rows=len(rows_on_page),
+        )
         for s in rows_on_page:
             if matches is None or matches(s):
                 out.append(s)
                 if target_count is not None and len(out) >= target_count:
                     return out
         pages_walked += 1
-        if pages_walked >= max_pages:
+        if pages_walked >= budget:
             break
         if not await _go_to_next_page(page):
             break
+        current_page_num += 1
     return out
 
 
 async def sync_shop_affiliate_links(page: Page, shop_edit_url: str, *, network: str,
                                     page_num: int, page_size: int,
+                                    shop_name: str | None = None,
                                     timeout_ms: int = 60_000) -> list:
-    log.info("sync_links.start", shop_edit_url=shop_edit_url)
+    log.info("sync_links.start", shop=shop_name, network=network, shop_edit_url=shop_edit_url)
     await page.goto(shop_edit_url, wait_until="domcontentloaded")
 
     # The Edit page is Convex-backed and renders async; wait for the inner Sync
@@ -256,11 +286,11 @@ async def sync_shop_affiliate_links(page: Page, shop_edit_url: str, *, network: 
     try:
         await items.first.wait_for(state="visible", timeout=20_000)
     except Exception:
-        log.info("sync_links.empty", shop_edit_url=shop_edit_url)
+        log.info("sync_links.empty", shop=shop_name, network=network, shop_edit_url=shop_edit_url)
         return []
 
     count = await items.count()
-    log.info("sync_links.found", count=count)
+    log.info("sync_links.found", shop=shop_name, network=network, count=count)
     out = []
     for i in range(count):
         it = items.nth(i)
@@ -350,10 +380,16 @@ async def run_sync(settings, store, browser_ctx) -> None:
         shops = await scrape_shops(
             page,
             max_pages=max_pages,
+            from_page=settings.sync.from_page,
+            to_page=settings.sync.to_page,
             matches=_matches,
             target_count=target_count,
         )
-        log.info("scrape_shops.collected", network=network, count=len(shops))
+        log.info(
+            "scrape_shops.collected",
+            network=network, count=len(shops),
+            from_page=settings.sync.from_page, to_page=settings.sync.to_page,
+        )
         for s in shops:
             await store.upsert_shop(
                 coinfiliate_id=s["coinfiliate_id"], name=s["name"],
@@ -372,6 +408,7 @@ async def run_sync(settings, store, browser_ctx) -> None:
             network=shop["network"],
             page_num=settings.sync.page,
             page_size=settings.sync.page_size,
+            shop_name=shop["name"],
         )
         for link in links:
             await store.upsert_affiliate_link(shop["id"], **link)

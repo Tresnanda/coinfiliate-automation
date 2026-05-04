@@ -132,8 +132,18 @@ async def writeback_shop(
 ) -> None:
     """Drive the Edit modal for a single harvested shop. Marks shop status accordingly."""
     shop = next(s for s in await store.list_shops() if s["id"] == shop_id)
+    log.info(
+        "writeback.shop.start",
+        shop=shop["name"], shop_id=shop_id, edit_url=shop["edit_url"],
+        dry_run=dry_run,
+    )
     latest = await store.latest_harvest(shop_id)
     if not latest or not latest["ok"]:
+        log.info(
+            "writeback.shop.skipped",
+            shop=shop["name"], shop_id=shop_id,
+            reason="no ok harvest row for writeback",
+        )
         await store.update_shop_status(
             shop_id, "needs_review",
             last_error="no ok harvest row for writeback",
@@ -196,21 +206,38 @@ async def writeback_shop(
                 'div[role="dialog"]:has-text("Edit Selected Partner Shop Links") '
                 'button:has-text("Cancel")'
             ).first.click()
-            log.info("writeback.dry_run_done", shop_id=shop_id)
+            log.info("writeback.shop.dry_run_done", shop=shop["name"], shop_id=shop_id)
             return
 
         submitted = await save_and_verify(page, decision)
 
         if settings.writeback.verify_after_save:
             if submitted.get("primary_cookie_name") != decision["primary_cookie_name"]:
+                log.error(
+                    "writeback.shop.verify_failed",
+                    shop=shop["name"], shop_id=shop_id,
+                    expected=decision["primary_cookie_name"],
+                    got=submitted.get("primary_cookie_name"),
+                )
                 await store.update_shop_status(
                     shop_id, "failed",
                     last_error=f"verify mismatch: got {submitted.get('primary_cookie_name')!r}",
                 )
                 return
 
+        log.info(
+            "writeback.shop.ok",
+            shop=shop["name"], shop_id=shop_id,
+            primary_cookie_name=submitted.get("primary_cookie_name"),
+            published=submitted.get("published"),
+        )
         await store.update_shop_status(shop_id, "writeback_done")
     except Exception as e:
+        log.error(
+            "writeback.shop.failed",
+            shop=shop["name"], shop_id=shop_id,
+            err=f"{type(e).__name__}: {e}",
+        )
         await store.update_shop_status(shop_id, "failed", last_error=f"{type(e).__name__}: {e}")
         raise
 
@@ -234,5 +261,6 @@ async def run_writeback(
                 browser_ctx=browser_ctx,
                 dry_run=dry_run,
             )
-        except Exception as e:
-            log.error("writeback.failed", shop_id=shop["id"], err=str(e))
+        except Exception:
+            # Inner writeback_shop already logged + persisted the failure.
+            pass

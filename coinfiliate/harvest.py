@@ -71,8 +71,17 @@ async def collect_signals(page: Page, context: BrowserContext, affiliate_url: st
 async def harvest_shop(store, *, shop_id: int, settings, llm, browser) -> None:
     """Per-shop harvest: open affiliate URL, collect signals, decide, persist."""
     shop = next(s for s in await store.list_shops() if s["id"] == shop_id)
+    log.info("harvest.shop.start", shop=shop["name"], network=shop["network"], shop_id=shop_id)
     src = await store.get_harvest_source(shop_id)
     if not src:
+        # The sync phase produced zero affiliate links for this shop, so there
+        # is no URL to follow for cookie/redirect signals. This is a data-state
+        # outcome, not a runtime error — mark and move on without raising.
+        log.info(
+            "harvest.shop.skipped",
+            shop=shop["name"], network=shop["network"], shop_id=shop_id,
+            reason="no harvest_source link",
+        )
         await store.update_shop_status(shop_id, "failed", last_error="no harvest_source link")
         return
 
@@ -107,11 +116,25 @@ async def harvest_shop(store, *, shop_id: int, settings, llm, browser) -> None:
             llm_rationale=decision.rationale, ok=ok,
         )
 
+        log.info(
+            "harvest.shop.ok",
+            shop=shop["name"], network=shop["network"], shop_id=shop_id,
+            decision_source=decision.decision_source,
+            confidence=decision.confidence,
+            primary_cookie_name=decision.primary_cookie_name,
+            ok=ok,
+        )
+
         if ok and decision.confidence >= settings.harvest.review_threshold:
             await store.update_shop_status(shop_id, "harvested")
         else:
             await store.update_shop_status(shop_id, "needs_review")
     except Exception as e:
+        log.error(
+            "harvest.shop.failed",
+            shop=shop["name"], network=shop["network"], shop_id=shop_id,
+            err=f"{type(e).__name__}: {e}",
+        )
         await store.update_shop_status(shop_id, "failed", last_error=f"{type(e).__name__}: {e}")
         raise
 
@@ -128,7 +151,9 @@ async def run_harvest(store, *, settings, llm, browser) -> None:
             await asyncio.sleep(random.randint(lo, hi) / 1000)
             try:
                 await harvest_shop(store, shop_id=shop_id, settings=settings, llm=llm, browser=browser)
-            except Exception as e:
-                log.error("harvest.shop_failed", shop_id=shop_id, err=str(e))
+            except Exception:
+                # Inner harvest_shop already logged + persisted the failure;
+                # swallow here so a single bad shop doesn't poison the batch.
+                pass
 
     await asyncio.gather(*[_one(s["id"]) for s in pending])

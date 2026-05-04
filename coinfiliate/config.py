@@ -19,6 +19,12 @@ class SyncConfig(BaseModel):
     # Hard cap on Partner Shop pages walked per network. The list paginates
     # client-side at 10 rows/page; large accounts can have 700+ rows.
     max_pages: int = 80
+    # Inclusive 1-indexed range of Partner Shop list pages to scrape. Defaults
+    # to "first page onwards, capped by max_pages". Set from_page=N to skip the
+    # first N-1 pages (e.g. resume after a partial run); set to_page=M to stop
+    # after page M. to_page=None means "no upper bound beyond max_pages".
+    from_page: int = 1
+    to_page: Optional[int] = None
 
 
 class RunnerConfig(BaseModel):

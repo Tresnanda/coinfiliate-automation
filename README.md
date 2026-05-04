@@ -50,8 +50,12 @@ python main.py writeback --dry-run  # walk modal but Cancel instead of Save
 python main.py doctor               # print selectors
 python main.py review               # list needs_review shops
 
-python main.py run --limit 5        # cap to 5 shops per batch
+python main.py run --limit 5                          # cap to 5 shops per batch
+python main.py run --from-page 5 --to-page 10         # only Partner Shop list pages 5..10 (inclusive)
+python main.py sync --from-page 12                    # resume sync from page 12 onwards
 ```
+
+`--from-page` / `--to-page` are 1-indexed and apply to the Coinfiliate Partner Shop *list* pagination (10 rows/page client-side), distinct from the FlexOffers API page passed into the Sync modal. The flags only scope the **sync** phase; harvest and writeback then run over whatever sync queued.
 
 ## Configuration
 
@@ -62,6 +66,8 @@ networks: ["flexoffers"]            # extend with awin/impact/cj when ready
 sync:
   target_status: "Draft"            # only persist shops whose status badge contains this; "" = any
   max_pages: 80                     # cap on Partner Shop list pages walked per network
+  from_page: 1                      # 1-indexed list page to start from (CLI: --from-page)
+  to_page: null                     # 1-indexed inclusive last page; null = bound by max_pages (CLI: --to-page)
   page_size: 100                    # bulk-sync page size
 runner:
   max_shops_per_batch: 50
@@ -76,6 +82,26 @@ llm:
 ```
 
 The Partner Shop list paginates client-side at 10 rows/page. `sync.max_pages` caps how many pages we walk per network; `sync.target_status` lets us scope to `Draft` so shops already `Published` are left alone — that's where the automation must NOT touch.
+
+## Logs
+
+Every run writes structured JSON logs to **both** stdout and a timestamped file under `logs/run_<YYYYMMDD_HHMMSS>.log`. The file path is announced as the first event of `run`:
+
+```json
+{"event": "pipeline.start", "log_file": "logs/run_20260504_101321.log", "limit": 5, "from_page": null, "to_page": null, "dry_run": false, ...}
+```
+
+Per-shop events carry the shop name so you can grep a specific shop's lifecycle:
+
+| Event | Phase | Notes |
+|---|---|---|
+| `sync_links.start` / `.found` / `.empty` | sync | per-shop affiliate-link sync |
+| `scrape_shops.page` | sync | one per Partner Shop list page walked |
+| `harvest.shop.start` / `.skipped` / `.ok` / `.failed` | harvest | `.skipped` fires for shops with no harvest_source link (FlexOffers returned zero links) |
+| `writeback.shop.start` / `.skipped` / `.ok` / `.verify_failed` / `.failed` | writeback | `.ok` includes `published: true/false` |
+| `pipeline.summary` | run | shops grouped by status at end-of-run |
+
+`logging.level` in `config.yaml` defaults to `INFO`. Set to `DEBUG` for Playwright-level verbosity.
 
 ## Tests
 
