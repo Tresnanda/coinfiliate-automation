@@ -68,9 +68,42 @@ async def fill_bulk_edit_modal(page: Page, decision: dict) -> None:
     await _fill_list_field(dlg, "Tracking Cookie Names",   decision.get("tracking_cookie_names", []))
 
 
+# WebSocket monkey-patch installed before navigation. It intercepts the
+# bulkUpdatePartnerShopLinks mutation (fired by the bulk-edit modal's
+# "Save Changes" click) and adds status='published' to its data arg. This
+# is how we publish every selected affiliate link as part of the same
+# operation that saves the cookie config — the alternative path (flipping
+# each per-link switch + clicking Update) loses to Convex's re-stream race
+# and the backend silently discards link status changes through the
+# updatePartnerShopFromForm mutation when bulkUpdate has touched the same
+# links recently.
+#
+# Empirically verified: bulkUpdate accepts {status:'published'} in its data
+# arg and persists the change for all selected ids. The mutation's strict
+# schema validator rejected combinations like {published:true, status:'...'},
+# but a single status field alone is accepted.
+_AUTOPUBLISH_WS_PATCH = """
+(() => {
+    const origSend = WebSocket.prototype.send;
+    WebSocket.prototype.send = function(data) {
+        try {
+            if (typeof data === 'string' && data.includes('bulkUpdatePartnerShopLinks')) {
+                const obj = JSON.parse(data);
+                if (obj.args && obj.args[0] && obj.args[0].data) {
+                    obj.args[0].data.status = 'published';
+                    data = JSON.stringify(obj);
+                }
+            }
+        } catch (e) { /* swallow — never break the original send */ }
+        return origSend.call(this, data);
+    };
+})();
+"""
+
+
 async def save_and_verify(page: Page, decision: dict) -> dict:
-    """Click Save Changes (modal), flip the outer Publish toggle, click Update,
-    then read the post-save publish label to confirm.
+    """Click Save Changes (modal), flip every per-link publish switch, flip
+    the shop-level Publish toggle, click Update, verify.
 
     Live UI 2026-05-04: the publish toggle is a single button whose label is
     the **target** action (not the current state):
@@ -93,14 +126,10 @@ async def save_and_verify(page: Page, decision: dict) -> dict:
         'div[role="dialog"]:has-text("Edit Selected Partner Shop Links")'
     ).wait_for(state="hidden", timeout=15_000)
 
-    # NOTE on per-link "draft" badge: each affiliate-link card has a draft
-    # badge + a role=switch toggle in its expanded form, but the switch fires
-    # zero network requests when clicked and its state never persists across
-    # a reload. Even fully-Published shops display "draft" on every per-link
-    # card (verified across VersedSkin/Alibaba/Bulova/Just Lawnmowers). The
-    # per-link draft badge is a Coinfiliate UI artifact, not a functional
-    # state — the only meaningful publish state is the shop-level toggle.
-    #
+    # The bulk-edit modal's bulkUpdate mutation already published every selected
+    # link (auto-injected status='published' via the WS monkey-patch installed
+    # in writeback_shop). No per-link UI iteration needed.
+
     # Click the shop-level publish-action button if the shop is in Draft.
     publish_btn = page.get_by_role("button", name="Published", exact=True)
     if await publish_btn.count() > 0 and await publish_btn.first.is_visible():
@@ -193,6 +222,9 @@ async def writeback_shop(
 
     try:
         page = await browser_ctx.new_page()
+        # Install the bulkUpdate auto-publish patch BEFORE navigation so it's
+        # active when fill_bulk_edit_modal + Save Changes fires its mutation.
+        await page.add_init_script(_AUTOPUBLISH_WS_PATCH)
         await page.goto(edit_url, wait_until="domcontentloaded")
 
         # The Affiliate Links tab is the default; clicking it is idempotent but
