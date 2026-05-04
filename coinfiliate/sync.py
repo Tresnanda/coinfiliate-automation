@@ -480,13 +480,37 @@ async def run_sync(settings, store, browser_ctx) -> None:
         edit_url = shop["edit_url"]
         if edit_url.startswith("/"):
             edit_url = f"https://www.coinfiliate.com{edit_url}"
-        links = await sync_shop_affiliate_links(
-            page, edit_url,
-            network=shop["network"],
-            page_num=settings.sync.page,
-            page_size=settings.sync.page_size,
-            shop_name=shop["name"],
-        )
+        # Per-shop link sync can hang on the FlexOffers Sync modal (observed:
+        # Brooklyn Fashion DE, modal never closed). Catch + log + continue so a
+        # single bad shop doesn't kill the whole batch and orphan the shops we
+        # already finished harvesting links for.
+        try:
+            links = await sync_shop_affiliate_links(
+                page, edit_url,
+                network=shop["network"],
+                page_num=settings.sync.page,
+                page_size=settings.sync.page_size,
+                shop_name=shop["name"],
+            )
+        except Exception as e:
+            log.error(
+                "sync_links.failed",
+                shop=shop["name"], shop_id=shop["id"],
+                err=f"{type(e).__name__}: {str(e)[:200]}",
+            )
+            await store.update_shop_status(
+                shop["id"], "failed",
+                last_error=f"sync_links: {type(e).__name__}: {str(e)[:200]}",
+            )
+            # Reload the listing to clear any stuck modal before the next shop.
+            try:
+                await page.goto(
+                    "https://www.coinfiliate.com/admin/partner-shop",
+                    wait_until="domcontentloaded",
+                )
+            except Exception:
+                pass
+            continue
         for link in links:
             await store.upsert_affiliate_link(shop["id"], **link)
         if links:
