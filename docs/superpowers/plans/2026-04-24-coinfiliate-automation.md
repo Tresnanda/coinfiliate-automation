@@ -6,7 +6,7 @@
 
 **Architecture:** Three-phase pipeline (`coinfiliate sync | harvest | writeback | run`) over a Playwright browser, SQLite state store, heuristic→LLM decision pipeline. Pluggable LLM provider (OpenAI or Gemini) via a Protocol boundary. Fully autonomous by default; HITL supported.
 
-**Tech Stack:** Python 3.10+, Playwright async, SQLite (via `aiosqlite`), Pydantic v2 + pydantic-settings, Typer, structlog, tldextract, OpenAI SDK, google-generativeai SDK, pytest + pytest-asyncio, aiohttp (test fixture server only).
+**Tech Stack:** Python 3.10+, Playwright async, SQLite (via `aiosqlite`), Pydantic v2 + pydantic-settings, Typer, structlog, tldextract, OpenAI SDK, google-genai SDK (`from google import genai` — NOT the deprecated `google-generativeai`), pytest + pytest-asyncio, aiohttp (test fixture server only).
 
 ---
 

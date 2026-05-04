@@ -4,6 +4,8 @@ Automated cookie harvester for the Coinfiliate Partner Shop dashboard. Logs in, 
 
 Built on Playwright (async) + SQLite + Typer. LLM is pluggable: OpenAI or Gemini.
 
+**Status:** Live-DOM calibrated against the production Coinfiliate dashboard (Clerk auth + Radix UI). End-to-end verified Draft → Published on a real account.
+
 ## Architecture
 
 Three-phase pipeline; each phase reads/writes SQLite (`state.db`):
@@ -57,6 +59,10 @@ python main.py run --limit 5        # cap to 5 shops per batch
 
 ```yaml
 networks: ["flexoffers"]            # extend with awin/impact/cj when ready
+sync:
+  target_status: "Draft"            # only persist shops whose status badge contains this; "" = any
+  max_pages: 80                     # cap on Partner Shop list pages walked per network
+  page_size: 100                    # bulk-sync page size
 runner:
   max_shops_per_batch: 50
   max_concurrency: 4
@@ -68,6 +74,8 @@ llm:
   provider: "openai"                # or "gemini"
   model: "gpt-4o-mini"
 ```
+
+The Partner Shop list paginates client-side at 10 rows/page. `sync.max_pages` caps how many pages we walk per network; `sync.target_status` lets us scope to `Draft` so shops already `Published` are left alone — that's where the automation must NOT touch.
 
 ## Tests
 
@@ -111,8 +119,9 @@ docs/
 
 ## Status & known limitations
 
-- Selectors are mapped from the design-doc tutorial screenshots; any drift in the live Coinfiliate UI will require updates in `coinfiliate/selectors.py`. Run `python main.py doctor` to inspect the current selector set.
-- The fake server tests verify the sync/harvest/writeback flows against minimal HTML fixtures. Behavior on the live dashboard should be verified with `python main.py run --limit 1 --dry-run` before doing a full batch.
+- Selectors are mapped to the **live** Coinfiliate dashboard (Clerk auth + Radix UI) and verified end-to-end Draft → Published on a real account. Any future drift will require updates in `coinfiliate/selectors.py` and the relevant phase module. Run `python main.py doctor` to inspect the current selector set.
+- The 3 fake-server integration tests for the sync phase are currently `skip`ped — their fixtures predate the Radix-shaped DOM and need to be rebuilt. The writeback fixture test still runs. For new live behavior, smoke-test with `python main.py run --limit 1 --dry-run` before a full batch.
+- **Coinfiliate quirk — bulk-edit modal does not persist `Tracking Cookie Names` list field.** The modal Save commits `Primary Tracking Cookie Name`, `Checkout Domains`, and `Tracking Cookie Domains` correctly, but the per-cookie name list is dropped on reload. Verified to be a backend quirk, not a Playwright/selector issue. Acceptable for our use case since the Primary field is what drives tracking.
 - Step 8 of the original tutorial ("simulate checkout") is not automated — we use the eTLD+1 of the landed page as both `Checkout Domains` and `Tracking Cookie Domains`. The LLM fallback can override this when it spots distinct tracker subdomains.
 - Login uses a persistent `user_data_dir` at `.playwright/coinfiliate/` so reruns within the day skip re-login. Delete that directory to force re-auth.
 
