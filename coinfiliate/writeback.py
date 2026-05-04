@@ -70,9 +70,18 @@ async def fill_bulk_edit_modal(page: Page, decision: dict) -> None:
 
 async def save_and_verify(page: Page, decision: dict) -> dict:
     """Click Save Changes (modal), flip the outer Publish toggle, click Update,
-    then reload and read back the persisted Primary Tracking Cookie Name to
-    confirm. Returns a dict matching the test fixture's payload shape so
-    callers can assert on it.
+    then read the post-save publish label to confirm.
+
+    Live UI 2026-05-04: the publish toggle is a single button whose label is
+    the **target** action (not the current state):
+
+    - shop currently Draft     → button reads "Published"   (click to publish)
+    - shop currently Published → button reads "Unpublished" (click to revert)
+
+    We only ever writeback Drafts (per `target_status` filter), so the right
+    action is always "click the button labeled 'Published' if it exists".
+    Empirically verified by clicking once on a Draft shop and watching the
+    label flip Published → Unpublished without a save.
     """
     # Save the modal first.
     save_btn = page.locator(
@@ -84,41 +93,53 @@ async def save_and_verify(page: Page, decision: dict) -> dict:
         'div[role="dialog"]:has-text("Edit Selected Partner Shop Links")'
     ).wait_for(state="hidden", timeout=15_000)
 
-    # Outer-page publish toggle. Live UI shows "Unpublished" when the shop is
-    # currently Draft (click to publish) and "Published" when already live
-    # (click would un-publish). Only click when currently Unpublished.
-    unpub_btn = page.locator('button:has-text("Unpublished")')
-    if await unpub_btn.count() > 0 and await unpub_btn.first.is_visible():
-        await unpub_btn.first.click()
+    # Click the publish-action button if the shop is in Draft.
+    publish_btn = page.get_by_role("button", name="Published", exact=True)
+    if await publish_btn.count() > 0 and await publish_btn.first.is_visible():
+        await publish_btn.first.click()
 
-    # Outer-page Update saves the whole shop record.
+    # Outer-page Update saves the whole shop record (including the publish flip).
     update_btn = page.locator('button:has-text("Update")').last
     await update_btn.wait_for(state="visible", timeout=10_000)
     await update_btn.click()
 
-    # Verification: after Update, the outer publish toggle should now read
-    # "Published" (it was "Unpublished" before, or already "Published" if the
-    # shop was previously published). We give Convex a moment to re-stream the
-    # data, then read the toggle state. This is much cheaper than a full
-    # reload-and-expand verification and avoids races against Convex re-mounting
-    # the affiliate-link list.
-    await page.wait_for_timeout(2_500)
-    publish_text = ""
+    # Verification: after Update, Convex re-streams and the toggle relabels.
+    # That re-stream can take a few seconds — a fixed 2.5s sleep would give
+    # false negatives (verified empirically: a separate reload of the edit
+    # page shows "Unpublished", but the in-flight read at 2.5s still sees
+    # "Published"). Poll instead of guess.
     try:
-        publish_btn = page.locator(
-            'button:has-text("Published"), button:has-text("Unpublished")'
-        ).last
-        publish_text = (await publish_btn.inner_text()).strip().lower()
+        await page.wait_for_function(
+            """() => {
+                for (const b of document.querySelectorAll('button[data-slot="button"]')) {
+                    if ((b.innerText || '').trim() === 'Unpublished') return true;
+                }
+                return false;
+            }""",
+            timeout=15_000,
+        )
+        publish_label = "unpublished"
     except Exception:
-        pass
+        # Toggle never settled to "Unpublished" within the window. Read whatever
+        # is currently there for diagnostic visibility in the log.
+        publish_label = ""
+        try:
+            toggle = page.locator(
+                'button[data-slot="button"]:text-is("Published"), '
+                'button[data-slot="button"]:text-is("Unpublished")'
+            ).first
+            publish_label = (await toggle.inner_text()).strip().lower()
+        except Exception:
+            pass
 
+    is_published = publish_label == "unpublished"
     return {
         "primary_cookie_name": decision.get("primary_cookie_name") or "",
-        "card_status": "published" if publish_text == "published" else "draft",
+        "card_status": "published" if is_published else "draft",
         "tracking_cookie_names": decision.get("tracking_cookie_names", []),
         "checkout_domains": decision.get("checkout_domains", []),
         "tracking_cookie_domains": decision.get("tracking_cookie_domains", []),
-        "published": publish_text == "published",
+        "published": is_published,
     }
 
 

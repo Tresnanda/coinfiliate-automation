@@ -164,16 +164,63 @@ async def _scrape_current_page(page: Page) -> list:
 
 
 async def _go_to_next_page(page: Page) -> bool:
-    """Click the Pagination Next button. Returns False if there is no next page."""
-    next_btn = page.locator('button[aria-label="Next page"]')
-    # When disabled, Radix sets the disabled attribute; treat that as no-more-pages.
-    if await next_btn.get_attribute("disabled") is not None:
+    """Click the Pagination Next button. Returns False if there is no next page.
+
+    Two correctness traps the live UI hits:
+
+    1. The button briefly flips to disabled mid-transition (Convex refetch).
+       Reading `disabled` once would falsely conclude "no more pages" on every
+       page. We re-check after a short wait window before giving up.
+    2. The table rows from the previous page stay mounted while the new page
+       is fetching. A naive `wait_for tr visible` returns instantly because the
+       old rows are still there. We capture the first row's name cell before
+       clicking and wait for it to *change* — that's the only reliable signal
+       the new page has rendered.
+    """
+    next_btn = page.locator('button[aria-label="Next page"]').first
+
+    async def _is_at_last_page() -> bool:
+        # Robust enable check (handles `disabled`, `aria-disabled`, etc.).
+        # Retry briefly to absorb transient disable during page re-render.
+        for _ in range(8):
+            try:
+                if await next_btn.is_enabled():
+                    return False
+            except Exception:
+                pass
+            await page.wait_for_timeout(250)
+        return True
+
+    if await _is_at_last_page():
         return False
+
+    rows = page.locator('tbody[data-slot="table-body"] tr[data-slot="table-row"]')
+    try:
+        before_text = (await rows.first.locator('td').nth(2).inner_text()).strip()
+    except Exception:
+        before_text = ""
+
     await next_btn.click()
-    # Wait for the table to settle on the next page (header + at least 1 body row).
-    await page.locator(
-        'tbody[data-slot="table-body"] tr[data-slot="table-row"]'
-    ).first.wait_for(state="visible", timeout=10_000)
+
+    # Wait for the first row's name cell to differ — proves the table actually
+    # transitioned. If it doesn't change within the window, fall through and
+    # let the caller decide based on what it scrapes.
+    try:
+        await page.wait_for_function(
+            """([sel, prev]) => {
+                const r = document.querySelector(sel);
+                if (!r) return false;
+                const cells = r.querySelectorAll('td');
+                if (cells.length < 3) return false;
+                return (cells[2].innerText || '').trim() !== prev;
+            }""",
+            arg=['tbody[data-slot="table-body"] tr[data-slot="table-row"]', before_text],
+            timeout=15_000,
+        )
+    except Exception:
+        # Best-effort — some pages may legitimately repeat the same first name
+        # (rare but possible). Caller will scrape whatever is now rendered.
+        pass
     return True
 
 
