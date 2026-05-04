@@ -116,6 +116,36 @@ async def sync_partner_shops(page: Page, *, network: str, page_num: int, page_si
     log.info("sync_shops.ok")
 
 
+async def _wait_for_rows_stable(
+    page: Page, *, settle_ms: int = 600, max_wait_ms: int = 6_000,
+) -> int:
+    """Poll the row count until it stops changing for `settle_ms`.
+
+    Convex streams rows progressively after a page transition, so reading
+    `count()` immediately can return a partial set. Empirically observed on
+    Partner Shop list page 54: live UI rendered 10 rows but our scrape saw
+    only 3 because we read before all rows hydrated.
+
+    Returns the final row count. If the table stays at zero, returns zero
+    after the max_wait window.
+    """
+    rows = page.locator('tbody[data-slot="table-body"] tr[data-slot="table-row"]')
+    interval = 200
+    elapsed = 0
+    last = -1
+    last_change = 0
+    while elapsed < max_wait_ms:
+        cur = await rows.count()
+        if cur != last:
+            last = cur
+            last_change = elapsed
+        elif elapsed - last_change >= settle_ms:
+            return cur
+        await page.wait_for_timeout(interval)
+        elapsed += interval
+    return max(0, last)
+
+
 async def _scrape_current_page(page: Page) -> list:
     """Scrape just the rows currently visible on the Partner Shop table.
 
@@ -124,7 +154,7 @@ async def _scrape_current_page(page: Page) -> list:
     opening the row's dropdown menu and reading the Edit menu item href.
     """
     rows = page.locator('tbody[data-slot="table-body"] tr[data-slot="table-row"]')
-    count = await rows.count()
+    count = await _wait_for_rows_stable(page)
     out = []
     for i in range(count):
         row = rows.nth(i)
