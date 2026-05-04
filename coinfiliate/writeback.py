@@ -93,7 +93,15 @@ async def save_and_verify(page: Page, decision: dict) -> dict:
         'div[role="dialog"]:has-text("Edit Selected Partner Shop Links")'
     ).wait_for(state="hidden", timeout=15_000)
 
-    # Click the publish-action button if the shop is in Draft.
+    # NOTE on per-link "draft" badge: each affiliate-link card has a draft
+    # badge + a role=switch toggle in its expanded form, but the switch fires
+    # zero network requests when clicked and its state never persists across
+    # a reload. Even fully-Published shops display "draft" on every per-link
+    # card (verified across VersedSkin/Alibaba/Bulova/Just Lawnmowers). The
+    # per-link draft badge is a Coinfiliate UI artifact, not a functional
+    # state — the only meaningful publish state is the shop-level toggle.
+    #
+    # Click the shop-level publish-action button if the shop is in Draft.
     publish_btn = page.get_by_role("button", name="Published", exact=True)
     if await publish_btn.count() > 0 and await publish_btn.first.is_visible():
         await publish_btn.first.click()
