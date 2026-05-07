@@ -26,14 +26,20 @@ async def test_decide_uses_strict_match_without_calling_llm():
     llm.analyze.assert_not_awaited()
 
 
-async def test_decide_uses_loose_match_without_calling_llm():
+async def test_decide_falls_back_to_llm_when_only_generic_analytics_cookies_present():
+    # __kla_id, _ga, _fbp etc. used to short-circuit as "loose" matches; now
+    # they must be sent to the LLM since they aren't true affiliate cookies.
     llm = MagicMock()
-    llm.analyze = AsyncMock()
+    llm.analyze = AsyncMock(return_value=HarvestDecision(
+        primary_cookie_name=None,
+        tracking_cookie_names=[],
+        checkout_domains=["s.com"],
+        tracking_cookie_domains=["s.com"],
+        decision_source="llm", confidence=0.2, rationale="no affiliate cookie",
+    ))
     d = await decide(_ctx([_cookie("__kla_id"), _cookie("_ga")]), llm=llm)
-    assert d.primary_cookie_name == "__kla_id"
-    assert d.decision_source == "heuristic"
-    assert d.confidence == 0.6
-    llm.analyze.assert_not_awaited()
+    assert d.decision_source == "llm"
+    llm.analyze.assert_awaited_once()
 
 
 async def test_decide_falls_back_to_llm_when_heuristics_miss():

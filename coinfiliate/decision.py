@@ -11,16 +11,6 @@ _STRICT_KEYWORDS = [
     "cj_source", "cje", "impact", "partnerize_", "rakuten_", "click_id",
 ]
 
-# Ordered by preference: per-user tracking IDs beat session IDs beat generic analytics
-_LOOSE_KEYWORDS_ORDERED = [
-    "__kla_id",           # Klaviyo
-    "ajs_anonymous_id",   # Segment
-    "_gcl_aw",            # Google Ads click ID
-    "_fbp",               # Facebook Pixel
-    "_shopify_y",         # Shopify long-lived anon
-    "_ga",                # Google Analytics (fallback)
-]
-
 
 def extract_etld1(url: str) -> str:
     ext = tldextract.extract(url)
@@ -36,16 +26,8 @@ def strict_match(cookies: List[dict]) -> Optional[dict]:
     return None
 
 
-def loose_match(cookies: List[dict]) -> Optional[dict]:
-    by_name = {c["name"]: c for c in cookies}
-    for kw in _LOOSE_KEYWORDS_ORDERED:
-        if kw in by_name:
-            return by_name[kw]
-    return None
-
-
 async def decide(ctx: HarvestContext, *, llm: CookieAnalyzer) -> HarvestDecision:
-    # 1. strict heuristic
+    # 1. strict heuristic — only network-native affiliate cookies match here.
     strict = strict_match(ctx.cookies)
     if strict:
         return HarvestDecision(
@@ -57,19 +39,8 @@ async def decide(ctx: HarvestContext, *, llm: CookieAnalyzer) -> HarvestDecision
             confidence=1.0,
             rationale=None,
         )
-    # 2. loose heuristic
-    loose = loose_match(ctx.cookies)
-    if loose:
-        return HarvestDecision(
-            primary_cookie_name=loose["name"],
-            tracking_cookie_names=[loose["name"]],
-            checkout_domains=[ctx.final_etld1],
-            tracking_cookie_domains=[ctx.final_etld1],
-            decision_source="heuristic",
-            confidence=0.6,
-            rationale=None,
-        )
-    # 3. LLM fallback
+    # 2. LLM fallback — generic analytics cookies (_ga, _fbp, __kla_id, …) are
+    # not affiliate trackers, so we let the model decide instead of guessing.
     try:
         return await llm.analyze(ctx)
     except Exception as e:
