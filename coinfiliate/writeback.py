@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from playwright.async_api import Page
 from coinfiliate.selectors import sel
@@ -220,8 +221,8 @@ async def writeback_shop(
     if edit_url.startswith("/"):
         edit_url = f"https://www.coinfiliate.com{edit_url}"
 
+    page = await browser_ctx.new_page()
     try:
-        page = await browser_ctx.new_page()
         # Install the bulkUpdate auto-publish patch BEFORE navigation so it's
         # active when fill_bulk_edit_modal + Save Changes fires its mutation.
         await page.add_init_script(_AUTOPUBLISH_WS_PATCH)
@@ -301,6 +302,11 @@ async def writeback_shop(
         )
         await store.update_shop_status(shop_id, "failed", last_error=f"{type(e).__name__}: {e}")
         raise
+    finally:
+        try:
+            await page.close()
+        except Exception:
+            pass
 
 
 async def run_writeback(
@@ -310,18 +316,28 @@ async def run_writeback(
     browser_ctx,
     dry_run: bool = False,
 ) -> None:
-    """Top-level orchestrator: writeback all 'harvested' shops sequentially."""
+    """Top-level orchestrator: writeback all 'harvested' shops with bounded concurrency.
+
+    Each shop runs on its own page of the shared (logged-in) BrowserContext.
+    Concurrency is capped by `runner.max_concurrency` to avoid hammering the
+    Coinfiliate backend with too many simultaneous Convex subscriptions.
+    """
     shops = await store.list_shops(status="harvested")
     shops = shops[: settings.runner.max_shops_per_batch]
-    for shop in shops:
-        try:
-            await writeback_shop(
-                store,
-                shop_id=shop["id"],
-                settings=settings,
-                browser_ctx=browser_ctx,
-                dry_run=dry_run,
-            )
-        except Exception:
-            # Inner writeback_shop already logged + persisted the failure.
-            pass
+    sem = asyncio.Semaphore(settings.runner.max_concurrency)
+
+    async def _one(shop):
+        async with sem:
+            try:
+                await writeback_shop(
+                    store,
+                    shop_id=shop["id"],
+                    settings=settings,
+                    browser_ctx=browser_ctx,
+                    dry_run=dry_run,
+                )
+            except Exception:
+                # Inner writeback_shop already logged + persisted the failure.
+                pass
+
+    await asyncio.gather(*[_one(s) for s in shops])

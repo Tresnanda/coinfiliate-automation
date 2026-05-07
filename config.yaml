@@ -9,7 +9,7 @@ sync:
 
 runner:
   max_shops_per_batch: 50
-  max_concurrency: 4
+  max_concurrency: 6
   inter_shop_jitter_ms: [500, 2000]
 
 harvest:
