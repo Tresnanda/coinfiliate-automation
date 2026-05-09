@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import re
 from typing import List, Optional
 from playwright.async_api import BrowserContext, Page
 from coinfiliate.browser import fresh_context
@@ -15,6 +16,31 @@ DEFAULT_CONSENT_TEXTS = [
     "Accept", "Allow All", "Accept All", "I Accept", "Agree", "Got it",
     "Alle akzeptieren", "Accepter", "Aceptar", "同意", "同意する",
 ]
+
+_ERROR_TITLE_PATTERN = re.compile(r"\b(404|not found|error|page does not exist)\b", re.I)
+
+
+async def is_error_page(page, *, response_status: int | None) -> bool:
+    """Return True if the landing page looks like a 404 / error / 'no product'.
+
+    Three signals checked, any of which fires:
+      - HTTP status >= 400 on the navigation response
+      - <title> matches a 404/not-found/error pattern
+      - <h1> matches the same pattern
+    """
+    if response_status is not None and response_status >= 400:
+        return True
+    info = await page.evaluate(
+        """() => ({
+            title: document.title || '',
+            h1: (document.querySelector('h1')?.innerText || '').slice(0, 200),
+        })"""
+    )
+    if _ERROR_TITLE_PATTERN.search(info.get("title") or ""):
+        return True
+    if _ERROR_TITLE_PATTERN.search(info.get("h1") or ""):
+        return True
+    return False
 
 
 async def collect_signals(page: Page, context: BrowserContext, affiliate_url: str,
