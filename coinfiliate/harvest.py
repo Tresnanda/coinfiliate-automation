@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 import random
 import re
-from typing import List, Optional
+from dataclasses import dataclass
+from typing import List, Optional, Union
 from playwright.async_api import BrowserContext, Page
 from coinfiliate.browser import fresh_context
 from coinfiliate.decision import decide, extract_etld1
@@ -99,6 +100,147 @@ async def collect_clickable_candidates(page) -> list[dict]:
     Capped at 80 to keep the LLM prompt small.
     """
     return await page.evaluate(_CLICKABLE_JS)
+
+
+@dataclass(frozen=True)
+class AttemptSuccess:
+    landing_url: str           # URL after consent + redirects (before product click)
+    checkout_url: str          # URL bar at the end of the active flow
+    cookies: List[dict]
+    redirect_chain: List[str]
+    tracker_domains: List[str]
+
+
+@dataclass(frozen=True)
+class AttemptFailure:
+    kind: str                  # "Error404" | "NoProduct" | "NoCart" | "NoCheckout" | "Error"
+    detail: Optional[str] = None
+
+
+AttemptResult = Union[AttemptSuccess, AttemptFailure]
+
+
+async def _click_one(page, candidates: list, *, idx: Optional[int],
+                     post_click_wait_ms: int = 1500) -> bool:
+    """Click candidates[idx]; return True on apparent success."""
+    if idx is None or not (0 <= idx < len(candidates)):
+        return False
+    selector = candidates[idx]["selector"]
+    try:
+        loc = page.locator(selector).first
+        await loc.click(timeout=10_000)
+        await page.wait_for_timeout(post_click_wait_ms)
+        return True
+    except Exception:
+        return False
+
+
+async def _drive_step(page, *, finder, goal: str, url: str) -> bool:
+    """One element-finder step with one re-snapshot retry on click failure."""
+    candidates = await collect_clickable_candidates(page)
+    idx = await finder.find_element(candidates=candidates, goal=goal, url=url)
+    if await _click_one(page, candidates, idx=idx):
+        return True
+    # One re-snapshot retry: the page may have updated since the snapshot.
+    candidates = await collect_clickable_candidates(page)
+    idx = await finder.find_element(candidates=candidates, goal=goal, url=page.url)
+    return await _click_one(page, candidates, idx=idx)
+
+
+async def attempt_link(
+    page, context, affiliate_url: str, *,
+    finder,
+    consent_texts: Optional[List[str]] = None,
+    consent_wait_ms: int = 2000,
+    networkidle_timeout_s: int = 15,
+) -> AttemptResult:
+    """Drive Landing → Product → Add-to-Cart → Checkout for one affiliate link.
+
+    Args:
+      page: a fresh Playwright Page.
+      context: the BrowserContext that owns `page` (we attach a response listener).
+      affiliate_url: the link to follow.
+      finder: an ElementFinder.
+
+    Returns AttemptSuccess on full traversal, or AttemptFailure with `kind`
+    set to one of "Error404"/"NoProduct"/"NoCart"/"NoCheckout"/"Error".
+    """
+    consent_texts = consent_texts or DEFAULT_CONSENT_TEXTS
+    response_urls: List[str] = []
+    redirect_chain: List[str] = []
+
+    def _on_response(resp):
+        response_urls.append(resp.url)
+        if 300 <= resp.status < 400:
+            redirect_chain.append(resp.url)
+
+    context.on("response", _on_response)
+
+    try:
+        nav = await page.goto(affiliate_url, wait_until="domcontentloaded")
+        try:
+            await page.wait_for_load_state("networkidle",
+                                           timeout=networkidle_timeout_s * 1000)
+        except Exception:
+            pass
+
+        for text in consent_texts:
+            try:
+                btn = page.locator(f"button:has-text('{text}'), a:has-text('{text}')").first
+                if await btn.is_visible(timeout=500):
+                    await btn.click()
+                    await page.wait_for_timeout(consent_wait_ms)
+                    break
+            except Exception:
+                continue
+
+        landing_url = page.url
+
+        if await is_error_page(page, response_status=nav.status if nav else None):
+            return AttemptFailure(kind="Error404", detail=f"landing={landing_url}")
+
+        if not await _drive_step(page, finder=finder,
+                                 goal="navigate to a product detail page", url=page.url):
+            return AttemptFailure(kind="NoProduct", detail=f"landing={landing_url}")
+
+        if not await _drive_step(page, finder=finder,
+                                 goal="add the current product to cart", url=page.url):
+            return AttemptFailure(kind="NoCart", detail=f"after_pdp={page.url}")
+
+        if not await _drive_step(page, finder=finder,
+                                 goal="proceed to checkout", url=page.url):
+            return AttemptFailure(kind="NoCheckout", detail=f"after_cart={page.url}")
+
+        # Wait for the post-checkout-click navigation to settle so we capture
+        # the final URL bar (Shopify checkouts are JS-routed).
+        try:
+            await page.wait_for_load_state("networkidle",
+                                           timeout=networkidle_timeout_s * 1000)
+        except Exception:
+            pass
+
+        cookies = await context.cookies()
+        checkout_url = page.url
+
+        tracker_domains = sorted({
+            extract_etld1(u) for u in response_urls
+            if extract_etld1(u) and extract_etld1(u) != extract_etld1(landing_url)
+        })
+
+        return AttemptSuccess(
+            landing_url=landing_url,
+            checkout_url=checkout_url,
+            cookies=list(cookies),
+            redirect_chain=list(redirect_chain),
+            tracker_domains=tracker_domains,
+        )
+    except Exception as e:
+        return AttemptFailure(kind="Error", detail=f"{type(e).__name__}: {e}")
+    finally:
+        try:
+            context.remove_listener("response", _on_response)
+        except Exception:
+            pass
 
 
 async def collect_signals(page: Page, context: BrowserContext, affiliate_url: str,
