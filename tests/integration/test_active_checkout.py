@@ -80,3 +80,70 @@ async def test_harvest_shop_active_flow_captures_checkout_cookie(tmp_path):
 
     await store.close()
     await runner.cleanup()
+
+
+@pytest.mark.integration
+async def test_harvest_shop_retries_to_next_link_when_first_is_404(tmp_path):
+    app = make_app()
+    runner = web.AppRunner(app); await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0); await site.start()
+    base = f"http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}"
+
+    store = Store(tmp_path / "t.db"); await store.init()
+    sid = await store.upsert_shop(coinfiliate_id="x", name="Fake", network="flexoffers",
+                                  advertiser_id=None, website_url=None, edit_url="/e")
+    # L1 is the dead link; L2 is the working one. mark_harvest_source(L1) makes
+    # L1 the first-tried link.
+    await store.upsert_affiliate_link(sid, link_id="L1", name="dead",
+                                      affiliate_url=f"{base}/aff_dead")
+    await store.upsert_affiliate_link(sid, link_id="L2", name="good",
+                                      affiliate_url=f"{base}/aff_active")
+    await store.mark_harvest_source(sid, "L1")
+
+    async with harvest_browser(headless=True) as browser:
+        await harvest_shop(store, shop_id=sid, settings=_settings(),
+                           llm=_StubFinder(), browser=browser)
+
+    shop = (await store.list_shops())[0]
+    assert shop["status"] == "harvested", f"got {shop['status']} err={shop['last_error']}"
+
+    latest = await store.latest_harvest(sid)
+    assert latest["attempted_link_id"] == "L2"
+    assert latest["primary_cookie_name"] == "pjnclick"
+
+    # is_harvest_source must now point to L2.
+    links = await store.list_affiliate_links(sid)
+    sources = [l["link_id"] for l in links if l["is_harvest_source"]]
+    assert sources == ["L2"]
+
+    await store.close()
+    await runner.cleanup()
+
+
+@pytest.mark.integration
+async def test_harvest_shop_marks_failed_when_all_links_404(tmp_path):
+    app = make_app()
+    runner = web.AppRunner(app); await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0); await site.start()
+    base = f"http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}"
+
+    store = Store(tmp_path / "t.db"); await store.init()
+    sid = await store.upsert_shop(coinfiliate_id="x", name="Fake", network="flexoffers",
+                                  advertiser_id=None, website_url=None, edit_url="/e")
+    await store.upsert_affiliate_link(sid, link_id="L1", name="dead1",
+                                      affiliate_url=f"{base}/aff_dead")
+    await store.upsert_affiliate_link(sid, link_id="L2", name="dead2",
+                                      affiliate_url=f"{base}/aff_dead")
+    await store.mark_harvest_source(sid, "L1")
+
+    async with harvest_browser(headless=True) as browser:
+        await harvest_shop(store, shop_id=sid, settings=_settings(),
+                           llm=_StubFinder(), browser=browser)
+
+    shop = (await store.list_shops())[0]
+    assert shop["status"] == "failed"
+    assert shop["last_error"] is not None
+    assert "Error404" in shop["last_error"]
+
+    await store.close()
+    await runner.cleanup()
