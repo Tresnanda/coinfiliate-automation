@@ -57,3 +57,40 @@ async def test_find_element_returns_none_when_idx_is_null():
     finder = OpenAICookieAnalyzer(client=client, model="m", max_retries=1, timeout_seconds=10)
     out = await finder.find_element(candidates=[], goal="g", url="https://x/")
     assert out is None
+
+
+@pytest.mark.unit
+async def test_gemini_find_element_returns_idx():
+    from coinfiliate.llm.gemini_client import GeminiCookieAnalyzer
+
+    fake_resp = MagicMock()
+    fake_resp.text = '{"idx": 1, "confidence": 0.8}'
+    client = MagicMock()
+    client.aio.models.generate_content = AsyncMock(return_value=fake_resp)
+
+    finder = GeminiCookieAnalyzer(client=client, model="m", max_retries=1)
+    out = await finder.find_element(
+        candidates=[
+            {"idx": 0, "tag": "a", "text": "x", "selector": "a"},
+            {"idx": 1, "tag": "button", "text": "Add to Cart", "selector": "form button"},
+        ],
+        goal="add to cart", url="https://x/",
+    )
+    assert out == 1
+
+
+@pytest.mark.unit
+async def test_gemini_find_element_handles_fenced_json():
+    """Gemini sometimes wraps JSON in ```json ... ``` fences; the impl must extract."""
+    from coinfiliate.llm.gemini_client import GeminiCookieAnalyzer
+
+    fake_resp = MagicMock()
+    fake_resp.text = '```json\n{"idx": 0, "confidence": 0.9}\n```'
+    client = MagicMock()
+    client.aio.models.generate_content = AsyncMock(return_value=fake_resp)
+    finder = GeminiCookieAnalyzer(client=client, model="m", max_retries=1)
+    out = await finder.find_element(
+        candidates=[{"idx": 0, "tag": "a", "text": "x", "selector": "a"}],
+        goal="g", url="https://x/",
+    )
+    assert out == 0
