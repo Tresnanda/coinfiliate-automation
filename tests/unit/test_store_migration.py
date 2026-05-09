@@ -55,3 +55,30 @@ async def test_init_is_idempotent_on_already_migrated_db(tmp_path):
         assert {"checkout_url", "checkout_etld1", "attempted_link_id"} <= cols
     finally:
         await store2.close()
+
+
+@pytest.mark.unit
+async def test_list_affiliate_links_ordered_puts_harvest_source_first(tmp_path):
+    store = Store(tmp_path / "t.db")
+    await store.init()
+    sid = await store.upsert_shop(coinfiliate_id="x", name="S", network="n",
+                                  advertiser_id=None, website_url=None, edit_url="/e")
+    await store.upsert_affiliate_link(sid, link_id="L1", name="a", affiliate_url="u1")
+    await store.upsert_affiliate_link(sid, link_id="L2", name="b", affiliate_url="u2")
+    await store.upsert_affiliate_link(sid, link_id="L3", name="c", affiliate_url="u3")
+    await store.mark_harvest_source(sid, "L2")
+
+    rows = await store.list_affiliate_links_ordered(sid)
+    assert [r["link_id"] for r in rows] == ["L2", "L1", "L3"]
+    await store.close()
+
+
+@pytest.mark.unit
+async def test_list_affiliate_links_ordered_empty_shop(tmp_path):
+    store = Store(tmp_path / "t.db")
+    await store.init()
+    sid = await store.upsert_shop(coinfiliate_id="x", name="S", network="n",
+                                  advertiser_id=None, website_url=None, edit_url="/e")
+    rows = await store.list_affiliate_links_ordered(sid)
+    assert rows == []
+    await store.close()

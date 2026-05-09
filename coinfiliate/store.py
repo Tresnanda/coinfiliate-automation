@@ -116,6 +116,15 @@ class Store:
         cur = await self._conn.execute("SELECT * FROM affiliate_link WHERE shop_id=? ORDER BY id", (shop_id,))
         return [dict(r) for r in await cur.fetchall()]
 
+    async def list_affiliate_links_ordered(self, shop_id: int) -> list:
+        """Return affiliate links ordered for retry: is_harvest_source first, then by id."""
+        cur = await self._conn.execute(
+            "SELECT * FROM affiliate_link WHERE shop_id=? "
+            "ORDER BY is_harvest_source DESC, id ASC",
+            (shop_id,),
+        )
+        return [dict(r) for r in await cur.fetchall()]
+
     async def get_harvest_source(self, shop_id: int) -> Optional[dict]:
         cur = await self._conn.execute(
             "SELECT * FROM affiliate_link WHERE shop_id=? AND is_harvest_source=1 LIMIT 1",
