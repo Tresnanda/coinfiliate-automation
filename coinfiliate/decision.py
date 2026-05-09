@@ -17,6 +17,22 @@ def extract_etld1(url: str) -> str:
     return f"{ext.domain}.{ext.suffix}" if ext.suffix else ext.domain
 
 
+def cookie_domain_etld1(cookie: dict) -> Optional[str]:
+    """Return eTLD+1 of a cookie's `domain` attribute, or None if absent/non-domain.
+
+    Strips a leading dot (Set-Cookie domains often start with '.', meaning the
+    cookie applies to subdomains). Returns None for localhost/IP/missing —
+    these aren't real eTLD+1 scopes.
+    """
+    raw = (cookie.get("domain") or "").lstrip(".").strip()
+    if not raw:
+        return None
+    ext = tldextract.extract(raw)
+    if not ext.suffix:
+        return None
+    return f"{ext.domain}.{ext.suffix}"
+
+
 def strict_match(cookies: List[dict]) -> Optional[dict]:
     for c in cookies:
         name = c["name"].lower()
