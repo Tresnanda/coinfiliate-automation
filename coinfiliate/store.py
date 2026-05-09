@@ -29,7 +29,23 @@ class Store:
         self._conn.row_factory = aiosqlite.Row
         await self._conn.execute("PRAGMA foreign_keys = ON")
         await self._conn.executescript(SCHEMA_PATH.read_text())
+        await self._migrate()
         await self._conn.commit()
+
+    async def _migrate(self) -> None:
+        """`schema.sql`'s CREATE TABLE IF NOT EXISTS won't add missing columns
+        to a pre-existing table; this method ALTERs them in instead.
+        """
+        cur = await self._conn.execute("PRAGMA table_info(harvest)")
+        cols = {row["name"] for row in await cur.fetchall()}
+        additions = [
+            ("checkout_url", "TEXT"),
+            ("checkout_etld1", "TEXT"),
+            ("attempted_link_id", "TEXT"),
+        ]
+        for col, typ in additions:
+            if col not in cols:
+                await self._conn.execute(f"ALTER TABLE harvest ADD COLUMN {col} {typ}")
 
     async def close(self) -> None:
         if self._conn:
@@ -115,20 +131,25 @@ class Store:
                              checkout_domains: Optional[Sequence[str]],
                              tracking_cookie_domains: Optional[Sequence[str]],
                              decision_source: str, confidence: Optional[float],
-                             llm_rationale: Optional[str], ok: bool) -> int:
+                             llm_rationale: Optional[str], ok: bool,
+                             checkout_url: Optional[str] = None,
+                             checkout_etld1: Optional[str] = None,
+                             attempted_link_id: Optional[str] = None) -> int:
         cur = await self._conn.execute(
             """INSERT INTO harvest
                  (shop_id, final_url, final_etld1, cookies_json, redirect_chain_json, tracker_domains_json,
                   primary_cookie_name, tracking_cookie_names_json, checkout_domains_json,
-                  tracking_cookie_domains_json, decision_source, confidence, llm_rationale, ok)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                  tracking_cookie_domains_json, decision_source, confidence, llm_rationale, ok,
+                  checkout_url, checkout_etld1, attempted_link_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (shop_id, final_url, final_etld1,
              json.dumps(list(cookies)), json.dumps(list(redirect_chain)), json.dumps(list(tracker_domains)),
              primary_cookie_name,
              json.dumps(list(tracking_cookie_names)) if tracking_cookie_names is not None else None,
              json.dumps(list(checkout_domains)) if checkout_domains is not None else None,
              json.dumps(list(tracking_cookie_domains)) if tracking_cookie_domains is not None else None,
-             decision_source, confidence, llm_rationale, 1 if ok else 0),
+             decision_source, confidence, llm_rationale, 1 if ok else 0,
+             checkout_url, checkout_etld1, attempted_link_id),
         )
         await self._conn.commit()
         return cur.lastrowid
