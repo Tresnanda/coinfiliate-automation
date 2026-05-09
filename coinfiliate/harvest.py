@@ -295,74 +295,117 @@ async def collect_signals(page: Page, context: BrowserContext, affiliate_url: st
 
 
 async def harvest_shop(store, *, shop_id: int, settings, llm, browser) -> None:
-    """Per-shop harvest: open affiliate URL, collect signals, decide, persist."""
+    """Per-shop harvest with retry across all affiliate links.
+
+    For each link in order (current is_harvest_source first, then by id),
+    open a fresh context, run attempt_link, and break on AttemptSuccess.
+    If all links fail, mark the shop failed/needs_review based on the
+    failure kinds seen.
+    """
     shop = next(s for s in await store.list_shops() if s["id"] == shop_id)
     log.info("harvest.shop.start", shop=shop["name"], network=shop["network"], shop_id=shop_id)
-    src = await store.get_harvest_source(shop_id)
-    if not src:
-        # The sync phase produced zero affiliate links for this shop, so there
-        # is no URL to follow for cookie/redirect signals. This is a data-state
-        # outcome, not a runtime error — mark and move on without raising.
-        log.info(
-            "harvest.shop.skipped",
-            shop=shop["name"], network=shop["network"], shop_id=shop_id,
-            reason="no harvest_source link",
-        )
-        await store.update_shop_status(shop_id, "failed", last_error="no harvest_source link")
+
+    links = await store.list_affiliate_links_ordered(shop_id)
+    if not links:
+        log.info("harvest.shop.skipped", shop=shop["name"], shop_id=shop_id,
+                 reason="no affiliate links")
+        await store.update_shop_status(shop_id, "failed",
+                                       last_error="no affiliate links")
         return
 
-    try:
-        async with fresh_context(browser) as ctx:
-            page = await ctx.new_page()
-            sig = await collect_signals(
-                page, ctx, src["affiliate_url"],
-                consent_wait_ms=settings.harvest.consent_wait_ms,
-                networkidle_timeout_s=settings.harvest.networkidle_timeout_seconds,
-            )
-        hctx = HarvestContext(
-            shop_name=shop["name"], network=shop["network"],
-            final_url=sig["final_url"], final_etld1=sig["final_etld1"],
-            cookies=sig["cookies"], redirect_chain=sig["redirect_chain"],
-            tracker_domains=sig["tracker_domains"],
-        )
-        decision = await decide(hctx, llm=llm)
-        ok = decision.primary_cookie_name is not None
+    failures: list[tuple[str, str]] = []
+    success: AttemptSuccess | None = None
+    chosen_link_id: str | None = None
 
-        await store.insert_harvest(
-            shop_id=shop_id,
-            final_url=sig["final_url"], final_etld1=sig["final_etld1"],
-            cookies=sig["cookies"], redirect_chain=sig["redirect_chain"],
-            tracker_domains=sig["tracker_domains"],
-            primary_cookie_name=decision.primary_cookie_name,
-            tracking_cookie_names=decision.tracking_cookie_names,
-            checkout_domains=decision.checkout_domains,
-            tracking_cookie_domains=decision.tracking_cookie_domains,
-            decision_source=decision.decision_source,
-            confidence=decision.confidence,
-            llm_rationale=decision.rationale, ok=ok,
-        )
+    for link in links:
+        try:
+            async with fresh_context(browser) as ctx:
+                page = await ctx.new_page()
+                result = await attempt_link(
+                    page, ctx, link["affiliate_url"],
+                    finder=llm,
+                    consent_wait_ms=settings.harvest.consent_wait_ms,
+                    networkidle_timeout_s=settings.harvest.networkidle_timeout_seconds,
+                )
+        except Exception as e:
+            failures.append((link["link_id"], f"Error:{type(e).__name__}"))
+            log.warning("harvest.shop.link.exception",
+                        shop=shop["name"], shop_id=shop_id,
+                        link_id=link["link_id"], err=f"{type(e).__name__}: {e}")
+            continue
 
-        log.info(
-            "harvest.shop.ok",
-            shop=shop["name"], network=shop["network"], shop_id=shop_id,
-            decision_source=decision.decision_source,
-            confidence=decision.confidence,
-            primary_cookie_name=decision.primary_cookie_name,
-            ok=ok,
-        )
+        if isinstance(result, AttemptSuccess):
+            success = result
+            chosen_link_id = link["link_id"]
+            log.info("harvest.shop.link.success",
+                     shop=shop["name"], shop_id=shop_id,
+                     link_id=link["link_id"], checkout_url=result.checkout_url)
+            break
 
-        if ok and decision.confidence >= settings.harvest.review_threshold:
-            await store.update_shop_status(shop_id, "harvested")
+        failures.append((link["link_id"], result.kind))
+        log.info("harvest.shop.link.failed",
+                 shop=shop["name"], shop_id=shop_id,
+                 link_id=link["link_id"], kind=result.kind, detail=result.detail)
+
+    if success is None:
+        kinds = {kind for _, kind in failures}
+        # 404 / no-product → almost certainly a dead shop. NoCart/NoCheckout/Error
+        # could be us misreading the UI on a real shop — kick to review.
+        if kinds and kinds <= {"Error404", "NoProduct"}:
+            status = "failed"
         else:
-            await store.update_shop_status(shop_id, "needs_review")
-    except Exception as e:
-        log.error(
-            "harvest.shop.failed",
-            shop=shop["name"], network=shop["network"], shop_id=shop_id,
-            err=f"{type(e).__name__}: {e}",
-        )
-        await store.update_shop_status(shop_id, "failed", last_error=f"{type(e).__name__}: {e}")
-        raise
+            status = "needs_review"
+        err = "; ".join(f"{lid}:{k}" for lid, k in failures)[:500]
+        log.error("harvest.shop.exhausted",
+                  shop=shop["name"], shop_id=shop_id,
+                  status=status, failures=failures)
+        await store.update_shop_status(shop_id, status, last_error=err)
+        return
+
+    checkout_etld1 = extract_etld1(success.checkout_url)
+    landing_etld1 = extract_etld1(success.landing_url)
+
+    hctx = HarvestContext(
+        shop_name=shop["name"], network=shop["network"],
+        final_url=success.landing_url, final_etld1=landing_etld1,
+        cookies=success.cookies, redirect_chain=success.redirect_chain,
+        tracker_domains=success.tracker_domains,
+        checkout_url=success.checkout_url, checkout_etld1=checkout_etld1,
+    )
+    decision = await decide(hctx, llm=llm)
+    ok = decision.primary_cookie_name is not None
+
+    await store.insert_harvest(
+        shop_id=shop_id,
+        final_url=success.landing_url, final_etld1=landing_etld1,
+        cookies=success.cookies, redirect_chain=success.redirect_chain,
+        tracker_domains=success.tracker_domains,
+        primary_cookie_name=decision.primary_cookie_name,
+        tracking_cookie_names=decision.tracking_cookie_names,
+        checkout_domains=decision.checkout_domains,
+        tracking_cookie_domains=decision.tracking_cookie_domains,
+        decision_source=decision.decision_source,
+        confidence=decision.confidence,
+        llm_rationale=decision.rationale, ok=ok,
+        checkout_url=success.checkout_url,
+        checkout_etld1=checkout_etld1,
+        attempted_link_id=chosen_link_id,
+    )
+
+    if chosen_link_id and chosen_link_id != links[0]["link_id"]:
+        await store.mark_harvest_source(shop_id, chosen_link_id)
+
+    log.info("harvest.shop.ok",
+             shop=shop["name"], shop_id=shop_id,
+             attempted_link_id=chosen_link_id,
+             decision_source=decision.decision_source,
+             confidence=decision.confidence,
+             primary_cookie_name=decision.primary_cookie_name, ok=ok)
+
+    if ok and decision.confidence >= settings.harvest.review_threshold:
+        await store.update_shop_status(shop_id, "harvested")
+    else:
+        await store.update_shop_status(shop_id, "needs_review")
 
 
 async def run_harvest(store, *, settings, llm, browser) -> None:
