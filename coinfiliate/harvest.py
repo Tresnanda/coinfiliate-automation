@@ -43,6 +43,64 @@ async def is_error_page(page, *, response_status: int | None) -> bool:
     return False
 
 
+_CLICKABLE_JS = r"""
+(() => {
+    // Select clickable elements: links, buttons, role=link/button.
+    // Compute a short, stable CSS selector for each by walking up to a
+    // unique ancestor or using nth-of-type as a last resort.
+    const NODES = Array.from(document.querySelectorAll(
+        'a[href], button, [role="button"], [role="link"], input[type="submit"], input[type="button"]'
+    )).filter(el => {
+        const r = el.getBoundingClientRect();
+        if (r.width === 0 && r.height === 0) return false;          // hidden
+        const cs = getComputedStyle(el);
+        if (cs.visibility === 'hidden' || cs.display === 'none') return false;
+        return true;
+    });
+
+    function selectorFor(el) {
+        if (el.id) return '#' + CSS.escape(el.id);
+        // Build a path with tag + nth-of-type, capped at 6 segments.
+        const parts = [];
+        let cur = el;
+        while (cur && cur.nodeType === 1 && parts.length < 6) {
+            let part = cur.tagName.toLowerCase();
+            const parent = cur.parentElement;
+            if (parent) {
+                const siblings = Array.from(parent.children).filter(c => c.tagName === cur.tagName);
+                if (siblings.length > 1) {
+                    const i = siblings.indexOf(cur) + 1;
+                    part += `:nth-of-type(${i})`;
+                }
+            }
+            parts.unshift(part);
+            if (cur.id) { parts[0] = '#' + CSS.escape(cur.id); break; }
+            cur = parent;
+        }
+        return parts.join(' > ');
+    }
+
+    return NODES.slice(0, 80).map((el, idx) => ({
+        idx,
+        tag: el.tagName.toLowerCase(),
+        text: (el.innerText || el.value || el.getAttribute('aria-label') || '').trim().slice(0, 120),
+        href: el.getAttribute('href') || null,
+        aria_label: el.getAttribute('aria-label') || null,
+        selector: selectorFor(el),
+    }));
+})()
+"""
+
+
+async def collect_clickable_candidates(page) -> list[dict]:
+    """Return up to 80 visible clickable elements with text + a CSS selector.
+
+    The element-finder LLM picks an `idx`; the caller maps back to `selector`.
+    Capped at 80 to keep the LLM prompt small.
+    """
+    return await page.evaluate(_CLICKABLE_JS)
+
+
 async def collect_signals(page: Page, context: BrowserContext, affiliate_url: str,
                           *, consent_texts: Optional[List[str]] = None,
                           consent_wait_ms: int = 2000,
