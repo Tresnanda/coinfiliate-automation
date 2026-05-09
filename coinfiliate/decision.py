@@ -42,6 +42,30 @@ def strict_match(cookies: List[dict]) -> Optional[dict]:
     return None
 
 
+def _checkout_domain(ctx: HarvestContext) -> str:
+    """Return the eTLD+1 to use for checkout_domains.
+
+    Falls back to landing eTLD+1 only when the active flow didn't run.
+    """
+    return ctx.checkout_etld1 or ctx.final_etld1
+
+
+def _tracking_cookie_domains(primary_cookie: dict, ctx: HarvestContext) -> List[str]:
+    """Compose tracking_cookie_domains from the cookie's own scope + checkout.
+
+    Use the primary cookie's own `domain` attribute (eTLD+1-normalized). If it
+    differs from the checkout eTLD+1, include both — the field is list-valued
+    and Coinfiliate's matcher checks any-match-wins.
+    """
+    checkout = _checkout_domain(ctx)
+    cookie_etld1 = cookie_domain_etld1(primary_cookie)
+    if cookie_etld1 is None:
+        return [checkout]
+    if cookie_etld1 == checkout:
+        return [checkout]
+    return [cookie_etld1, checkout]
+
+
 async def decide(ctx: HarvestContext, *, llm: CookieAnalyzer) -> HarvestDecision:
     # 1. strict heuristic — only network-native affiliate cookies match here.
     strict = strict_match(ctx.cookies)
@@ -49,8 +73,8 @@ async def decide(ctx: HarvestContext, *, llm: CookieAnalyzer) -> HarvestDecision
         return HarvestDecision(
             primary_cookie_name=strict["name"],
             tracking_cookie_names=[strict["name"]],
-            checkout_domains=[ctx.final_etld1],
-            tracking_cookie_domains=[ctx.final_etld1],
+            checkout_domains=[_checkout_domain(ctx)],
+            tracking_cookie_domains=_tracking_cookie_domains(strict, ctx),
             decision_source="heuristic",
             confidence=1.0,
             rationale=None,
@@ -63,8 +87,8 @@ async def decide(ctx: HarvestContext, *, llm: CookieAnalyzer) -> HarvestDecision
         return HarvestDecision(
             primary_cookie_name=None,
             tracking_cookie_names=[],
-            checkout_domains=[ctx.final_etld1],
-            tracking_cookie_domains=[ctx.final_etld1],
+            checkout_domains=[_checkout_domain(ctx)],
+            tracking_cookie_domains=[_checkout_domain(ctx)],
             decision_source="llm",
             confidence=0.0,
             rationale=f"LLM failed: {e}",

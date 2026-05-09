@@ -24,9 +24,11 @@ SCHEMA = {
 def build_user_prompt(ctx: HarvestContext) -> str:
     return (
         f"Shop: {ctx.shop_name} (network={ctx.network})\n"
-        f"Final URL: {ctx.final_url}\n"
-        f"eTLD+1: {ctx.final_etld1}\n\n"
-        f"Cookies set on the landing page:\n{json.dumps(ctx.cookies, indent=2)}\n\n"
+        f"Final landing URL: {ctx.final_url}\n"
+        f"Landing eTLD+1: {ctx.final_etld1}\n"
+        f"Checkout URL: {ctx.checkout_url or '(not captured)'}\n"
+        f"Checkout eTLD+1: {ctx.checkout_etld1 or '(not captured)'}\n\n"
+        f"Cookies set on the landing page and through checkout:\n{json.dumps(ctx.cookies, indent=2)}\n\n"
         f"Third-party tracker domains seen in the redirect chain:\n{json.dumps(ctx.tracker_domains, indent=2)}\n\n"
         f"Redirect chain:\n{json.dumps(ctx.redirect_chain, indent=2)}\n\n"
         f"Respond with strict JSON matching this schema:\n{json.dumps(SCHEMA, indent=2)}"

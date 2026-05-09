@@ -6,10 +6,11 @@ from coinfiliate.models import HarvestContext, HarvestDecision
 from coinfiliate.decision import decide
 
 
-def _ctx(cookies):
+def _ctx(cookies, *, checkout_url="https://s.com/checkouts/cn/abc", checkout_etld1="s.com"):
     return HarvestContext(shop_name="S", network="flexoffers",
                           final_url="https://s.com/", final_etld1="s.com",
-                          cookies=cookies, redirect_chain=[], tracker_domains=[])
+                          cookies=cookies, redirect_chain=[], tracker_domains=[],
+                          checkout_url=checkout_url, checkout_etld1=checkout_etld1)
 
 
 def _cookie(name):
@@ -64,3 +65,35 @@ async def test_decide_returns_empty_when_llm_also_yields_nothing():
     assert d.primary_cookie_name is None
     assert d.decision_source == "llm"
     assert d.confidence == 0.0
+
+
+async def test_strict_match_uses_checkout_etld1_for_checkout_domains():
+    llm = MagicMock(); llm.analyze = AsyncMock()
+    ctx = _ctx(
+        [{"name": "pjnclick", "value": "v", "domain": ".s.com"}],
+        checkout_url="https://s.com/checkouts/cn/x", checkout_etld1="s.com",
+    )
+    d = await decide(ctx, llm=llm)
+    assert d.checkout_domains == ["s.com"]
+
+
+async def test_strict_match_uses_cookie_domain_for_tracking_cookie_domains():
+    llm = MagicMock(); llm.analyze = AsyncMock()
+    # Cookie scoped to .merchant.com, checkout on pay.shopify.com — different eTLD+1s.
+    ctx = _ctx(
+        [{"name": "pjnclick", "value": "v", "domain": ".merchant.com"}],
+        checkout_url="https://pay.shopify.com/x", checkout_etld1="shopify.com",
+    )
+    d = await decide(ctx, llm=llm)
+    assert "merchant.com" in d.tracking_cookie_domains
+    assert "shopify.com" in d.tracking_cookie_domains
+
+
+async def test_strict_match_falls_back_to_checkout_etld1_when_cookie_has_no_domain():
+    llm = MagicMock(); llm.analyze = AsyncMock()
+    ctx = _ctx(
+        [{"name": "pjnclick", "value": "v"}],  # host-only cookie, no domain attr
+        checkout_url="https://s.com/checkouts/cn/x", checkout_etld1="s.com",
+    )
+    d = await decide(ctx, llm=llm)
+    assert d.tracking_cookie_domains == ["s.com"]

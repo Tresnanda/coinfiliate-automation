@@ -14,6 +14,11 @@ class HarvestContext:
     cookies: List[dict] = field(default_factory=list)
     redirect_chain: List[str] = field(default_factory=list)
     tracker_domains: List[str] = field(default_factory=list)
+    # URL bar at the end of the active checkout flow, and its eTLD+1.
+    # Same as final_url/final_etld1 if the active flow wasn't run (e.g. unit
+    # tests passing a passive context).
+    checkout_url: Optional[str] = None
+    checkout_etld1: Optional[str] = None
 
 
 @dataclass(frozen=True)
